@@ -1,0 +1,24 @@
+# Config (contains local paths)
+verify_config.json
+
+# Reports
+reports/
+verify_report_*.txt
+
+# Cache
+.verify_cache.db
+.verify_cache.db-wal
+.verify_cache.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Poetry
+poetry.lock
+
+# IDE
+.vscode/
+.idea/
