@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Entrypoint script for batch backup verification.
+"""Unified entrypoint for backup verification.
 
-Reads verify_config.json and runs verify_backup.py for each enabled job.
+Single verification:
+    python verify.py <src_dir> <dest_dir> [options]
 
-Usage:
-    python verify.py                        # run all enabled jobs
-    python verify.py --list                 # list all jobs
-    python verify.py --only "FUJIFILM X-T5" # run specific job(s) by name
-    python verify.py --config my_config.json
-    python verify.py --workers 8            # override worker count
-    python verify.py --mode smart           # set comparison mode
-    python verify.py --strict               # treat metadata diffs as failures
-    python verify.py --no-cache             # pass --no-cache to all jobs
-    python verify.py --clear-cache          # pass --clear-cache to all jobs
+Batch verification (from config file):
+    python verify.py -c verify_config.json [options]
+    python verify.py -c verify_config.json --only "FUJIFILM X-T5"
+    python verify.py -c verify_config.json --list
+
+No arguments (uses default config if present):
+    python verify.py
 """
 
 from __future__ import annotations
@@ -20,19 +18,44 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime
 
+from verify_backup import run_verify
+
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_config.json")
-VERIFY_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_backup.py")
 
 
 def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Load and parse JSON config file with friendly error handling.
+
+    Paths in config should use forward slashes (e.g., "W:/path").
+    They are automatically normalized for the current OS.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Failed to parse {path}: {e}")
+        print('Hint: Use forward slashes in paths (e.g., "W:/storage/photos")')
+        print('      Backslashes in JSON require escaping ("W:\\\\path"), which is error-prone.')
+        sys.exit(1)
+    except FileNotFoundError:
+        print(f"Error: config not found: {path}")
+        sys.exit(1)
+
+    # Normalize paths for current OS
+    for job in config.get("jobs", []):
+        for key in ("src", "dest"):
+            if key in job:
+                job[key] = os.path.normpath(job[key])
+
+    if "output_dir" in config:
+        config["output_dir"] = os.path.normpath(config["output_dir"])
+
+    return config
 
 
 def list_jobs(config: dict) -> None:
@@ -50,41 +73,12 @@ def list_jobs(config: dict) -> None:
         print(f"{name:<30s} {enabled:<8s} {src} -> {dest}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Batch backup verification entrypoint")
-    parser.add_argument("-c", "--config", type=str, default=DEFAULT_CONFIG,
-                        help="Config file path (default: verify_config.json)")
-    parser.add_argument("-l", "--list", action="store_true",
-                        help="List all configured jobs and exit")
-    parser.add_argument("--only", type=str, nargs="+", metavar="NAME",
-                        help="Run only jobs matching these names")
-    parser.add_argument("-w", "--workers", type=int, default=None,
-                        help="Override worker thread count")
-    parser.add_argument("-m", "--mode", type=str, default=None,
-                        choices=["full", "smart", "data-only"],
-                        help="Override comparison mode for all jobs")
-    parser.add_argument("--strict", action="store_true",
-                        help="Treat metadata-only diffs as failures")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Pass --no-cache to all jobs")
-    parser.add_argument("--clear-cache", action="store_true",
-                        help="Pass --clear-cache to all jobs")
-    args = parser.parse_args()
-
-    if not os.path.isfile(args.config):
-        print(f"Error: config not found: {args.config}")
-        sys.exit(1)
-
-    config = load_config(args.config)
-
-    if args.list:
-        list_jobs(config)
-        sys.exit(0)
-
+def run_batch(args, config: dict) -> int:
+    """Run batch verification from config file. Returns exit code."""
     jobs = config.get("jobs", [])
     if not jobs:
-        print(f"No jobs configured in {args.config}")
-        sys.exit(1)
+        print("No jobs configured in config file")
+        return 1
 
     # Filter jobs
     if args.only:
@@ -95,15 +89,16 @@ def main() -> None:
             print("Available jobs:")
             for j in jobs:
                 print(f"  - {j.get('name', '(unnamed)')}")
-            sys.exit(1)
+            return 1
     else:
         selected = [j for j in jobs if j.get("enabled", True)]
 
     if not selected:
         print("No enabled jobs to run.")
-        sys.exit(0)
+        return 0
 
-    workers = args.workers or config.get("workers", 4)
+    default_workers = min(os.cpu_count() or 4, 16)
+    workers = args.workers or config.get("workers", default_workers)
     output_dir = config.get("output_dir", "./reports")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -111,7 +106,6 @@ def main() -> None:
 
     print("=" * 70)
     print("Batch Verification")
-    print(f"Config   : {args.config}")
     print(f"Jobs     : {len(selected)} selected")
     print(f"Workers  : {workers}")
     print(f"Reports  : {os.path.abspath(output_dir)}")
@@ -147,22 +141,18 @@ def main() -> None:
         # Resolve mode: CLI override > per-job > global config > default
         job_mode = args.mode or job.get("mode") or config.get("mode", "smart")
 
-        cmd = [
-            sys.executable, VERIFY_SCRIPT,
+        rc = run_verify(
             src, dest,
-            "-w", str(job_workers),
-            "-o", report_file,
-            "--mode", job_mode,
-        ]
-        if args.strict:
-            cmd.append("--strict")
-        if args.no_cache:
-            cmd.append("--no-cache")
-        if args.clear_cache:
-            cmd.append("--clear-cache")
-
-        ret = subprocess.call(cmd)
-        results.append((name, "PASS" if ret == 0 else "FAIL", report_file))
+            workers=job_workers,
+            mode=job_mode,
+            strict=args.strict,
+            no_cache=args.no_cache,
+            clear_cache=args.clear_cache,
+            output=report_file,
+            verbose=args.verbose,
+            dry_run=args.dry_run,
+        )
+        results.append((name, "PASS" if rc == 0 else "FAIL", report_file))
 
     elapsed = time.time() - t_start
 
@@ -181,7 +171,103 @@ def main() -> None:
     print("-" * 70)
     print(f"Passed: {passed}  Failed: {failed}  Skipped: {skipped}")
 
-    sys.exit(1 if failed else 0)
+    return 1 if failed else 0
+
+
+def main() -> None:
+    default_workers = min(os.cpu_count() or 4, 16)
+
+    parser = argparse.ArgumentParser(
+        description="Backup verification tool",
+        usage="""%(prog)s <src_dir> <dest_dir> [options]
+       %(prog)s -c CONFIG [options]
+       %(prog)s                          (uses default config)""",
+    )
+
+    # Positional args for single mode (optional)
+    parser.add_argument("src_dir", nargs="?", default=None,
+                        help="Source directory (SD card)")
+    parser.add_argument("dest_dir", nargs="?", default=None,
+                        help="Destination directory (NAS backup)")
+
+    # Batch mode args
+    parser.add_argument("-c", "--config", type=str, default=None,
+                        help="Config file for batch verification")
+    parser.add_argument("-l", "--list", action="store_true",
+                        help="List all configured jobs and exit")
+    parser.add_argument("--only", type=str, nargs="+", metavar="NAME",
+                        help="Run only jobs matching these names (batch mode)")
+
+    # Common args
+    parser.add_argument("-w", "--workers", type=int, default=None,
+                        help="Override worker thread count (default: auto, max 16)")
+    parser.add_argument("-m", "--mode", type=str, default=None,
+                        choices=["full", "smart", "data-only"],
+                        help="Comparison mode (default: smart)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Treat metadata-only diffs as failures")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Skip hash cache entirely")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Delete existing cache and rebuild from scratch")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose output (show every file)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Scan only, show cache hit rate, do not hash")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Report file path (single mode only)")
+    args = parser.parse_args()
+
+    # Determine mode: single vs batch
+    has_positional = args.src_dir is not None
+    has_config = args.config is not None
+
+    if has_positional and has_config:
+        parser.error("Cannot specify both positional args (src dest) and --config")
+
+    if args.list:
+        # --list requires --config or default config
+        config_path = args.config or DEFAULT_CONFIG
+        if not os.path.isfile(config_path):
+            print(f"Error: config not found: {config_path}")
+            sys.exit(1)
+        config = load_config(config_path)
+        list_jobs(config)
+        sys.exit(0)
+
+    if has_config:
+        # Batch mode
+        config = load_config(args.config)
+        rc = run_batch(args, config)
+        sys.exit(rc)
+
+    if has_positional:
+        if args.dest_dir is None:
+            parser.error("dest_dir is required in single mode")
+
+        # Single mode
+        rc = run_verify(
+            args.src_dir,
+            args.dest_dir,
+            workers=args.workers or default_workers,
+            mode=args.mode or "smart",
+            strict=args.strict,
+            no_cache=args.no_cache,
+            clear_cache=args.clear_cache,
+            output=args.output,
+            verbose=args.verbose,
+            dry_run=args.dry_run,
+        )
+        sys.exit(rc)
+
+    # No args at all — try default config
+    if os.path.isfile(DEFAULT_CONFIG):
+        config = load_config(DEFAULT_CONFIG)
+        rc = run_batch(args, config)
+        sys.exit(rc)
+
+    parser.print_help()
+    sys.exit(1)
 
 
 if __name__ == "__main__":

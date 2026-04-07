@@ -2,6 +2,7 @@
 """Unit tests for verify_backup.py"""
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 # Import module under test
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +23,7 @@ from verify_backup import (
     is_jpeg,
     load_cache_all,
     open_cache_db,
+    run_verify,
     sha256,
     sha256_dual,
     scan_dir,
@@ -267,23 +270,25 @@ class TestScanDir(unittest.TestCase):
     def test_finds_files(self):
         _write_file(self.tmpdir, "a.jpg", b'\x00')
         _write_file(self.tmpdir, "sub/b.txt", b'\x01\x02')
-        files = scan_dir(Path(self.tmpdir))
+        files, errors = scan_dir(Path(self.tmpdir))
         names = [p.name for p, _, _ in files]
         self.assertIn("a.jpg", names)
         self.assertIn("b.txt", names)
         self.assertEqual(len(files), 2)
+        self.assertEqual(len(errors), 0)
 
     def test_excludes_cache_file(self):
         _write_file(self.tmpdir, CACHE_FILENAME, b'db data')
         _write_file(self.tmpdir, "real.jpg", b'\x00')
-        files = scan_dir(Path(self.tmpdir))
+        files, errors = scan_dir(Path(self.tmpdir))
         names = [p.name for p, _, _ in files]
         self.assertNotIn(CACHE_FILENAME, names)
         self.assertEqual(len(files), 1)
 
     def test_empty_dir(self):
-        files = scan_dir(Path(self.tmpdir))
+        files, errors = scan_dir(Path(self.tmpdir))
         self.assertEqual(files, [])
+        self.assertEqual(errors, [])
 
 
 class TestCacheDB(unittest.TestCase):
@@ -637,6 +642,350 @@ class TestEndToEnd(unittest.TestCase):
         ]
         result = subprocess.run(cmd2, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
+
+
+class TestScanDirErrors(unittest.TestCase):
+    """Test error tolerance in scan_dir."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_scan_dir_returns_errors_tuple(self):
+        """scan_dir should return (files, errors) tuple."""
+        _write_file(self.tmpdir, "a.txt", b'data')
+        result = scan_dir(Path(self.tmpdir))
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        files, errors = result
+        self.assertEqual(len(files), 1)
+        self.assertEqual(len(errors), 0)
+
+
+class TestQuietVerboseOutput(unittest.TestCase):
+    """Test default quiet vs verbose output modes."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmpdir, "src")
+        self.dest = os.path.join(self.tmpdir, "dest")
+        os.makedirs(self.src)
+        os.makedirs(self.dest)
+        self.report = os.path.join(self.tmpdir, "report.txt")
+        self.script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_backup.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_default_quiet_no_per_file_ok(self):
+        """Default (quiet) mode should not show per-file OK lines in output."""
+        data = b'test content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        # In quiet mode, stdout should NOT contain "OK       file.txt"
+        # (it uses \r progress instead)
+        output = result.stdout
+        self.assertNotIn("OK       file.txt", output)
+
+    def test_verbose_shows_per_file(self):
+        """Verbose mode should show per-file results."""
+        data = b'test content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache", "-v",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        output = result.stdout
+        self.assertIn("OK", output)
+        self.assertIn("file.txt", output)
+
+    def test_verbose_report_has_matched_files(self):
+        """Verbose mode report should include MATCHED FILES section."""
+        data = b'test content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache", "-v",
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+
+        with open(self.report) as f:
+            report_text = f.read()
+        self.assertIn("MATCHED FILES", report_text)
+
+    def test_default_report_no_matched_files(self):
+        """Default mode report should NOT include MATCHED FILES section."""
+        data = b'test content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache",
+        ]
+        subprocess.run(cmd, capture_output=True, text=True)
+
+        with open(self.report) as f:
+            report_text = f.read()
+        self.assertNotIn("MATCHED FILES", report_text)
+
+
+class TestEmptyDirWarning(unittest.TestCase):
+    """Test empty directory warnings."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmpdir, "src")
+        self.dest = os.path.join(self.tmpdir, "dest")
+        os.makedirs(self.src)
+        os.makedirs(self.dest)
+        self.report = os.path.join(self.tmpdir, "report.txt")
+        self.script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_backup.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_empty_src_warning(self):
+        """Empty source directory should show warning."""
+        _write_file(self.dest, "file.txt", b'data')
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        output = result.stdout + result.stderr
+        self.assertIn("Warning", output)
+        self.assertIn("empty", output)
+
+    def test_empty_dest_warning(self):
+        """Empty dest directory should show warning."""
+        _write_file(self.src, "file.txt", b'data')
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        output = result.stdout + result.stderr
+        self.assertIn("Warning", output)
+        self.assertIn("empty", output)
+
+
+class TestDryRun(unittest.TestCase):
+    """Test dry-run mode."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmpdir, "src")
+        self.dest = os.path.join(self.tmpdir, "dest")
+        os.makedirs(self.src)
+        os.makedirs(self.dest)
+        self.script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_backup.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_dry_run_no_hash(self):
+        """Dry-run should scan but not produce a report file."""
+        data = b'test content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+        report = os.path.join(self.tmpdir, "report.txt")
+
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "--mode", "full", "--no-cache", "--dry-run",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        output = result.stdout
+        self.assertIn("Dry-run", output)
+        self.assertIn("Source files", output)
+        self.assertIn("Need hashing", output)
+        # Should NOT generate a report file
+        self.assertFalse(os.path.exists(report))
+
+    def test_dry_run_shows_cache_hits(self):
+        """Dry-run with cache should show cache hit rate."""
+        data = b'test content for caching'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+        report = os.path.join(self.tmpdir, "report.txt")
+
+        # First run to populate cache
+        cmd1 = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", report, "--mode", "full",
+        ]
+        subprocess.run(cmd1, capture_output=True)
+
+        # Dry-run should show cache hits
+        cmd2 = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "--mode", "full", "--dry-run",
+        ]
+        result = subprocess.run(cmd2, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        output = result.stdout
+        self.assertIn("Cache hits", output)
+
+
+class TestUnifiedEntry(unittest.TestCase):
+    """Test unified verify.py entrypoint."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmpdir, "src")
+        self.dest = os.path.join(self.tmpdir, "dest")
+        os.makedirs(self.src)
+        os.makedirs(self.dest)
+        self.report = os.path.join(self.tmpdir, "report.txt")
+        self.script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify.py")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir)
+
+    def test_single_mode(self):
+        """verify.py <src> <dest> should work in single mode."""
+        data = b'identical content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        cmd = [
+            sys.executable, self.script,
+            self.src, self.dest,
+            "-w", "1", "-o", self.report, "--mode", "full", "--no-cache",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        with open(self.report) as f:
+            report_text = f.read()
+        self.assertIn("Matched (OK)       : 1", report_text)
+
+    def test_batch_mode(self):
+        """verify.py -c config.json should work in batch mode."""
+        data = b'identical content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        reports_dir = os.path.join(self.tmpdir, "reports")
+        config = {
+            "workers": 1,
+            "mode": "full",
+            "output_dir": reports_dir,
+            "jobs": [
+                {
+                    "name": "test job",
+                    "src": self.src,
+                    "dest": self.dest,
+                    "enabled": True,
+                }
+            ]
+        }
+        config_path = os.path.join(self.tmpdir, "test_config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        cmd = [
+            sys.executable, self.script,
+            "-c", config_path, "--no-cache",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("PASS", result.stdout)
+
+    def test_config_unix_paths(self):
+        """Config with forward-slash paths should work on any OS."""
+        data = b'identical content'
+        _write_file(self.src, "file.txt", data)
+        _write_file(self.dest, "file.txt", data)
+
+        reports_dir = os.path.join(self.tmpdir, "reports")
+        # Use forward slashes in config paths
+        config = {
+            "workers": 1,
+            "mode": "full",
+            "output_dir": reports_dir.replace("\\", "/"),
+            "jobs": [
+                {
+                    "name": "unix paths test",
+                    "src": self.src.replace("\\", "/"),
+                    "dest": self.dest.replace("\\", "/"),
+                    "enabled": True,
+                }
+            ]
+        }
+        config_path = os.path.join(self.tmpdir, "test_config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        cmd = [
+            sys.executable, self.script,
+            "-c", config_path, "--no-cache",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("PASS", result.stdout)
+
+    def test_config_json_error(self):
+        """Invalid JSON config should show friendly error."""
+        config_path = os.path.join(self.tmpdir, "bad_config.json")
+        with open(config_path, "w") as f:
+            f.write('{"src": "C:\\bad\\path"}')  # unescaped backslash
+
+        cmd = [
+            sys.executable, self.script,
+            "-c", config_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        output = result.stdout + result.stderr
+        self.assertIn("Hint", output)
+
+    def test_list_jobs(self):
+        """verify.py -c config --list should list jobs."""
+        config = {
+            "jobs": [
+                {"name": "Job A", "src": "/a", "dest": "/b"},
+                {"name": "Job B", "src": "/c", "dest": "/d", "enabled": False},
+            ]
+        }
+        config_path = os.path.join(self.tmpdir, "test_config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        cmd = [
+            sys.executable, self.script,
+            "-c", config_path, "--list",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Job A", result.stdout)
+        self.assertIn("Job B", result.stdout)
+        self.assertIn("No", result.stdout)  # Job B disabled
 
 
 if __name__ == "__main__":

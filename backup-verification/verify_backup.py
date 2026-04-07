@@ -23,6 +23,7 @@ Usage:
     python verify_backup.py <src_dir> <dest_dir> --no-cache
     python verify_backup.py <src_dir> <dest_dir> --clear-cache
     python verify_backup.py <src_dir> <dest_dir> --strict
+    python verify_backup.py <src_dir> <dest_dir> --dry-run
 
 Example:
     python verify_backup.py "O:\\DCIM\\100_FUJI" "W:\\storage\\ingest\\...\\FUJIFILM X-T5"
@@ -50,6 +51,7 @@ JPEG_EXTENSIONS = (".jpg", ".jpeg")
 
 CacheEntry = Dict[str, object]
 FileInfo = Tuple[Path, int, float]  # (path, size, mtime)
+ScanError = Tuple[Path, str]  # (path, error_message)
 
 
 def sha256(path: str | Path) -> str:
@@ -123,13 +125,22 @@ def fmt_size(n: float) -> str:
     return f"{n:.1f} PB"
 
 
-def scan_dir(directory: Path) -> List[FileInfo]:
+def scan_dir(directory: Path) -> Tuple[List[FileInfo], List[ScanError]]:
+    """Scan directory for files. Returns (files, errors).
+
+    Files that cannot be stat'd (permission errors, etc.) are collected
+    in the errors list instead of raising.
+    """
     files: List[FileInfo] = []
+    errors: List[ScanError] = []
     for p in sorted(directory.rglob("*")):
         if p.is_file() and p.name != CACHE_FILENAME:
-            st = p.stat()
-            files.append((p, st.st_size, st.st_mtime))
-    return files
+            try:
+                st = p.stat()
+                files.append((p, st.st_size, st.st_mtime))
+            except OSError as e:
+                errors.append((p, str(e)))
+    return files, errors
 
 
 # --- SQLite hash cache ---
@@ -227,37 +238,38 @@ def sync_cache(
     conn.commit()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Verify SD card backup checksums")
-    parser.add_argument("src_dir", help="Source directory (SD card)")
-    parser.add_argument("dest_dir", help="Destination directory (NAS backup)")
-    parser.add_argument("-w", "--workers", type=int, default=4,
-                        help="Number of hash threads (default: 4)")
-    parser.add_argument("-o", "--output", type=str, default=None,
-                        help="Save report to file (default: auto-generated name)")
-    parser.add_argument("-m", "--mode", type=str, default="smart",
-                        choices=["full", "smart", "data-only"],
-                        help="Comparison mode (default: smart)")
-    parser.add_argument("--strict", action="store_true",
-                        help="Treat metadata-only diffs as failures")
-    parser.add_argument("--no-cache", action="store_true",
-                        help="Skip hash cache entirely")
-    parser.add_argument("--clear-cache", action="store_true",
-                        help="Delete existing cache and rebuild from scratch")
-    args = parser.parse_args()
+def run_verify(
+    src_dir: str | Path,
+    dest_dir: str | Path,
+    *,
+    workers: int | None = None,
+    mode: str = "smart",
+    strict: bool = False,
+    no_cache: bool = False,
+    clear_cache: bool = False,
+    output: str | None = None,
+    verbose: bool = False,
+    dry_run: bool = False,
+) -> int:
+    """Run verification. Returns exit code (0=pass, 1=fail).
 
-    src_dir = Path(args.src_dir)
-    dest_dir = Path(args.dest_dir)
-    mode = args.mode
+    This is the main programmatic API. The CLI main() function parses
+    arguments and delegates to this function.
+    """
+    src_dir = Path(src_dir)
+    dest_dir = Path(dest_dir)
+
+    if workers is None:
+        workers = min(os.cpu_count() or 4, 16)
 
     if not src_dir.is_dir():
         print(f"Error: source directory not found: {src_dir}")
-        sys.exit(1)
+        return 1
     if not dest_dir.is_dir():
         print(f"Error: destination directory not found: {dest_dir}")
-        sys.exit(1)
+        return 1
 
-    if args.clear_cache:
+    if clear_cache:
         cp = cache_db_path(dest_dir)
         if cp.exists():
             os.remove(cp)
@@ -267,14 +279,24 @@ def main() -> None:
 
     # --- Scan ---
     print(f"Scanning source: {src_dir}")
-    src_files = scan_dir(src_dir)
+    src_files, src_errors = scan_dir(src_dir)
     src_total_size = sum(s for _, s, _ in src_files)
     print(f"  Found {len(src_files)} files ({fmt_size(src_total_size)})")
+    if src_errors:
+        print(f"  Warning: {len(src_errors)} file(s) could not be read (permission/IO error)")
+
+    if not src_files:
+        print(f"  Warning: source directory is empty -- verify the path is correct")
 
     print(f"Scanning destination: {dest_dir}")
-    dest_files = scan_dir(dest_dir)
+    dest_files, dest_errors = scan_dir(dest_dir)
     dest_total_size = sum(s for _, s, _ in dest_files)
     print(f"  Found {len(dest_files)} files ({fmt_size(dest_total_size)})")
+    if dest_errors:
+        print(f"  Warning: {len(dest_errors)} file(s) could not be read (permission/IO error)")
+
+    if not dest_files:
+        print(f"  Warning: destination directory is empty -- verify the path is correct")
 
     # Group dest files by size
     dest_by_size: Dict[int, List[Path]] = defaultdict(list)
@@ -282,7 +304,7 @@ def main() -> None:
         dest_by_size[size].append(p)
 
     # --- Load and validate cache ---
-    use_cache = not args.no_cache
+    use_cache = not no_cache
     cache_hits = cache_stale = cache_new = cache_removed = 0
     valid: Dict[str, CacheEntry] = {}
     removed_keys: List[str] = []
@@ -305,6 +327,37 @@ def main() -> None:
         conn = None
         print("\nCache: disabled")
 
+    # --- Dry-run: show stats and exit ---
+    if dry_run:
+        src_sizes = {s for _, s, _ in src_files}
+        candidates_count = sum(1 for p, s, _ in dest_files if s in src_sizes)
+
+        # Count how many dest files needing hash are already cached
+        dest_to_hash_count = 0
+        dest_to_hash_size = 0
+        for p, size, mtime in dest_files:
+            if size not in src_sizes:
+                continue
+            key = str(p)
+            if key not in valid:
+                dest_to_hash_count += 1
+                dest_to_hash_size += size
+
+        print(f"\nDry-run results:")
+        print(f"  Source files : {len(src_files)} ({fmt_size(src_total_size)})")
+        print(f"  Dest files   : {len(dest_files)} ({fmt_size(dest_total_size)})")
+        print(f"  Candidates   : {candidates_count} (size-matched dest files)")
+        if use_cache:
+            total_relevant = candidates_count
+            hits = total_relevant - dest_to_hash_count
+            pct = (hits / total_relevant * 100) if total_relevant > 0 else 0
+            print(f"  Cache hits   : {hits} / {total_relevant} ({pct:.1f}%)")
+        print(f"  Need hashing : {dest_to_hash_count} files ({fmt_size(dest_to_hash_size)})")
+
+        if use_cache and conn:
+            conn.close()
+        return 0
+
     # --- Pre-compute dest checksums ---
     src_sizes = {s for _, s, _ in src_files}
     dest_to_hash: List[FileInfo] = []
@@ -323,19 +376,26 @@ def main() -> None:
             dest_to_hash.append((p, size, mtime))
 
     if dest_to_hash:
-        print(f"\nHashing {len(dest_to_hash)} dest files with {args.workers} threads...")
+        print(f"\nHashing {len(dest_to_hash)} dest files with {workers} threads...")
     else:
         print("\nAll dest candidates served from cache.")
 
     dest_hash_lock = Lock()
     done_count = [0]
     new_cache_entries: Dict[str, CacheEntry] = {}
+    dest_hash_errors: List[Tuple[Path, str]] = []
 
-    def hash_dest(path: Path, size: int, mtime: float) -> str:
-        if mode in ("smart", "data-only") and is_jpeg(path):
-            h, dh = sha256_dual(path)
-        else:
-            h, dh = sha256(path), None
+    def hash_dest(path: Path, size: int, mtime: float) -> None:
+        try:
+            if mode in ("smart", "data-only") and is_jpeg(path):
+                h, dh = sha256_dual(path)
+            else:
+                h, dh = sha256(path), None
+        except OSError as e:
+            with dest_hash_lock:
+                dest_hash_errors.append((path, str(e)))
+                done_count[0] += 1
+            return
 
         with dest_hash_lock:
             dest_checksums[path] = h
@@ -346,14 +406,19 @@ def main() -> None:
             }
             done_count[0] += 1
             if done_count[0] % 10 == 0 or done_count[0] == len(dest_to_hash):
-                print(f"  Dest hashed: {done_count[0]}/{len(dest_to_hash)}")
-        return h
+                pct = done_count[0] / len(dest_to_hash) * 100
+                if verbose:
+                    print(f"  Dest hashed: {done_count[0]}/{len(dest_to_hash)}")
+                else:
+                    print(f"\r  Dest hashed: {done_count[0]}/{len(dest_to_hash)} ({pct:.0f}%)", end="", flush=True)
 
     if dest_to_hash:
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(hash_dest, p, s, m) for p, s, m in dest_to_hash]
             for f in as_completed(futures):
                 f.result()
+        if not verbose and dest_to_hash:
+            print()  # newline after \r progress
 
     # --- Save updated cache ---
     if use_cache and conn:
@@ -362,12 +427,13 @@ def main() -> None:
         conn.close()
 
     # --- Hash source files in parallel and match ---
-    print(f"\nHashing {len(src_files)} source files and verifying... (mode={mode})")
+    print(f"\nVerifying {len(src_files)} source files... (mode={mode})")
 
     matched: List[Tuple] = []
     metadata_diff: List[Tuple] = []
     missing: List[Path] = []
     corrupted: List[Tuple] = []
+    io_errors: List[Tuple[Path, str]] = []
     results_lock = Lock()
     src_done = [0]
 
@@ -379,15 +445,26 @@ def main() -> None:
             with results_lock:
                 missing.append(rel)
                 src_done[0] += 1
-                print(f"  [{src_done[0]}/{len(src_files)}] MISSING  {rel}")
+                pct = src_done[0] / len(src_files) * 100
+                if verbose:
+                    print(f"  [{src_done[0]}/{len(src_files)} {pct:3.0f}%] MISSING  {rel}")
+                else:
+                    print(f"  MISSING  {rel}")
             return
 
-        # Single-pass: compute full hash + data hash in one read
-        need_dual = mode in ("smart", "data-only") and is_jpeg(src_path)
-        if need_dual:
-            src_hash, src_data_hash = sha256_dual(src_path)
-        else:
-            src_hash, src_data_hash = sha256(src_path), None
+        # Hash the source file
+        try:
+            need_dual = mode in ("smart", "data-only") and is_jpeg(src_path)
+            if need_dual:
+                src_hash, src_data_hash = sha256_dual(src_path)
+            else:
+                src_hash, src_data_hash = sha256(src_path), None
+        except OSError as e:
+            with results_lock:
+                io_errors.append((rel, str(e)))
+                src_done[0] += 1
+                print(f"  ERROR    {rel} ({e})")
+            return
 
         # --- data-only mode: match by image-data hash only ---
         if mode == "data-only" and is_jpeg(src_path):
@@ -399,13 +476,17 @@ def main() -> None:
                     with results_lock:
                         matched.append((rel, dest_rel, use_hash))
                         src_done[0] += 1
-                        print(f"  [{src_done[0]}/{len(src_files)}] OK       {rel} -> {dest_rel} (data-only)")
+                        pct = src_done[0] / len(src_files) * 100
+                        if verbose:
+                            print(f"  [{src_done[0]}/{len(src_files)} {pct:3.0f}%] OK       {rel} -> {dest_rel} (data-only)")
+                        else:
+                            print(f"\r  [{src_done[0]}/{len(src_files)} {pct:3.0f}%] Verifying...", end="", flush=True)
                     return
 
             with results_lock:
                 corrupted.append((rel, use_hash))
                 src_done[0] += 1
-                print(f"  [{src_done[0]}/{len(src_files)}] MISMATCH {rel} (image data differs)")
+                print(f"  MISMATCH {rel} (image data differs)")
             return
 
         # --- full / smart mode: try exact full-file match ---
@@ -415,7 +496,11 @@ def main() -> None:
                 with results_lock:
                     matched.append((rel, dest_rel, src_hash))
                     src_done[0] += 1
-                    print(f"  [{src_done[0]}/{len(src_files)}] OK       {rel} -> {dest_rel}")
+                    pct = src_done[0] / len(src_files) * 100
+                    if verbose:
+                        print(f"  [{src_done[0]}/{len(src_files)} {pct:3.0f}%] OK       {rel} -> {dest_rel}")
+                    else:
+                        print(f"\r  [{src_done[0]}/{len(src_files)} {pct:3.0f}%] Verifying...", end="", flush=True)
                 return
 
         # --- smart fallback: image-data hash (already computed above) ---
@@ -427,19 +512,26 @@ def main() -> None:
                     with results_lock:
                         metadata_diff.append((rel, dest_rel, src_hash, dest_full, src_data_hash))
                         src_done[0] += 1
-                        print(f"  [{src_done[0]}/{len(src_files)}] METADIFF {rel} -> {dest_rel} (EXIF differs, image data OK)")
+                        pct = src_done[0] / len(src_files) * 100
+                        if verbose:
+                            print(f"  [{src_done[0]}/{len(src_files)} {pct:3.0f}%] METADIFF {rel} -> {dest_rel} (EXIF differs, image data OK)")
+                        else:
+                            print(f"  METADIFF {rel} -> {dest_rel}")
                     return
 
         # No match at all
         with results_lock:
             corrupted.append((rel, src_hash))
             src_done[0] += 1
-            print(f"  [{src_done[0]}/{len(src_files)}] MISMATCH {rel} (checksum differs)")
+            print(f"  MISMATCH {rel} (checksum differs)")
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(verify_one, p, s) for p, s, _ in src_files]
         for f in as_completed(futures):
             f.result()
+
+    if not verbose and src_files:
+        print()  # newline after \r progress
 
     elapsed = time.time() - t_start
 
@@ -451,9 +543,9 @@ def main() -> None:
         f"Source   : {src_dir}",
         f"Dest     : {dest_dir}",
         f"Mode     : {mode}",
-        f"Strict   : {args.strict}",
+        f"Strict   : {strict}",
         f"Elapsed  : {elapsed:.1f}s",
-        f"Threads  : {args.workers}",
+        f"Threads  : {workers}",
     ]
     if use_cache:
         lines.append(f"Cache    : {cache_hits} valid, {cache_stale} stale, {cache_new} new, {cache_removed} removed")
@@ -467,10 +559,15 @@ def main() -> None:
         f"Metadata diff      : {len(metadata_diff)}",
         f"Missing in dest    : {len(missing)}",
         f"Checksum mismatch  : {len(corrupted)}",
-        "",
+        f"Read errors        : {len(io_errors)}",
     ]
+    if src_errors or dest_errors:
+        lines.append(f"Scan errors        : {len(src_errors)} src, {len(dest_errors)} dest")
+    if dest_hash_errors:
+        lines.append(f"Dest hash errors   : {len(dest_hash_errors)}")
+    lines.append("")
 
-    if matched:
+    if verbose and matched:
         lines += ["-" * 70, "MATCHED FILES:", "-" * 70]
         for src_rel, dest_rel, h in sorted(matched):
             lines.append(f"  {src_rel} -> {dest_rel}")
@@ -499,8 +596,32 @@ def main() -> None:
             lines.append(f"    SHA-256 (source): {h}")
         lines.append("")
 
-    has_failure = bool(missing or corrupted)
-    if args.strict and metadata_diff:
+    if io_errors:
+        lines += ["-" * 70, "READ ERRORS (files could not be accessed):", "-" * 70]
+        for f, err in sorted(io_errors):
+            lines.append(f"  {f}")
+            lines.append(f"    Error: {err}")
+        lines.append("")
+
+    if src_errors or dest_errors:
+        lines += ["-" * 70, "SCAN ERRORS (files skipped during directory scan):", "-" * 70]
+        for f, err in src_errors:
+            lines.append(f"  [src]  {f}")
+            lines.append(f"    Error: {err}")
+        for f, err in dest_errors:
+            lines.append(f"  [dest] {f}")
+            lines.append(f"    Error: {err}")
+        lines.append("")
+
+    if dest_hash_errors:
+        lines += ["-" * 70, "DEST HASH ERRORS (dest files could not be hashed):", "-" * 70]
+        for f, err in dest_hash_errors:
+            lines.append(f"  {f}")
+            lines.append(f"    Error: {err}")
+        lines.append("")
+
+    has_failure = bool(missing or corrupted or io_errors or src_errors or dest_errors or dest_hash_errors)
+    if strict and metadata_diff:
         has_failure = True
 
     if not has_failure and not metadata_diff:
@@ -511,14 +632,57 @@ def main() -> None:
         lines.append("VERIFICATION FAILED -- see details above.")
 
     report = "\n".join(lines)
+
+    # Print summary to terminal
     print(f"\n{report}")
 
-    report_name = args.output or f"verify_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    # Save report to file
+    report_name = output or f"verify_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     with open(report_name, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"\nReport saved to: {os.path.abspath(report_name)}")
 
-    sys.exit(1 if has_failure else 0)
+    return 1 if has_failure else 0
+
+
+def main() -> None:
+    default_workers = min(os.cpu_count() or 4, 16)
+
+    parser = argparse.ArgumentParser(description="Verify SD card backup checksums")
+    parser.add_argument("src_dir", help="Source directory (SD card)")
+    parser.add_argument("dest_dir", help="Destination directory (NAS backup)")
+    parser.add_argument("-w", "--workers", type=int, default=default_workers,
+                        help=f"Number of hash threads (default: {default_workers})")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Save report to file (default: auto-generated name)")
+    parser.add_argument("-m", "--mode", type=str, default="smart",
+                        choices=["full", "smart", "data-only"],
+                        help="Comparison mode (default: smart)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Treat metadata-only diffs as failures")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Skip hash cache entirely")
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Delete existing cache and rebuild from scratch")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose output (show every file, include MATCHED FILES in report)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Scan only, show cache hit rate, do not hash")
+    args = parser.parse_args()
+
+    rc = run_verify(
+        args.src_dir,
+        args.dest_dir,
+        workers=args.workers,
+        mode=args.mode,
+        strict=args.strict,
+        no_cache=args.no_cache,
+        clear_cache=args.clear_cache,
+        output=args.output,
+        verbose=args.verbose,
+        dry_run=args.dry_run,
+    )
+    sys.exit(rc)
 
 
 if __name__ == "__main__":
