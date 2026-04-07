@@ -1,0 +1,21 @@
+{
+  "workers": 4,
+  "mode": "smart",
+  "output_dir": "./reports",
+  "jobs": [
+    {
+      "name": "Camera SD Card",
+      "src": "E:\\DCIM\\100_FUJI",
+      "dest": "Z:\\backup\\photos\\Camera",
+      "enabled": true,
+      "workers": 8,
+      "mode": "smart"
+    },
+    {
+      "name": "Phone Photos",
+      "src": "F:\\DCIM\\Camera",
+      "dest": "Z:\\backup\\photos\\Phone",
+      "enabled": false
+    }
+  ]
+}
