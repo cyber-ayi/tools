@@ -1,0 +1,129 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly Monday 04:17 UTC — catches newly-disclosed CVEs without piling onto Mondays.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pip-audit:
+    name: pip-audit (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # backup-verification uses Poetry's legacy `[tool.poetry]` (no PEP 621
+        # `[project]` block), which pip-audit can't read directly. It also has
+        # no runtime deps — only `python = ^3.8` — so there's nothing to audit.
+        # Re-add it to the matrix once it migrates to PEP 621 (or the Poetry
+        # plugin lands in pip-audit).
+        project: [rclone-migrate]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pip-audit
+        run: pip install pip-audit
+      - name: Audit ${{ matrix.project }}
+        working-directory: ${{ matrix.project }}
+        # pip-audit reads PEP 621 deps from pyproject.toml directly.
+        # `--strict` makes the run fail on any vulnerability; the JSON artifact
+        # is uploaded below for triage.
+        run: pip-audit --strict --format json --output audit.json .
+      - name: Upload audit JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-${{ matrix.project }}
+          path: ${{ matrix.project }}/audit.json
+          retention-days: 30
+
+  bandit:
+    name: bandit (Python SAST)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      security-events: write  # for SARIF upload
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install 'bandit[sarif,toml]'
+      - name: Run bandit
+        # `-x` excludes test code (pytest-style asserts trip B101).
+        # Continue on findings — SARIF upload surfaces them in the Security tab.
+        run: |
+          bandit -r backup-verification rclone-migrate \
+            -x '*/tests/*,*/test_*.py' \
+            --severity-level medium --confidence-level medium \
+            -f sarif -o bandit.sarif || true
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so PR scans cover all new commits
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc  # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No GITLEAKS_LICENSE — free tier is fine for personal/public repos.
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: 'true'
+          GITLEAKS_ENABLE_SUMMARY: 'true'
+
+  trivy-fs:
+    name: trivy (filesystem)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy.sarif
+          exit-code: '0'  # don't fail build; surface via Security tab
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-fs
