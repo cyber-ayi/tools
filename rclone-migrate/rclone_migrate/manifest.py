@@ -173,11 +173,14 @@ def _refresh_local(
         digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
         db_path = fallback_dir / f"cache-{digest}.db"
 
-    # Walk directory
+    # Walk directory. Skip our own sidecar dirs (.rmig-cache.db family +
+    # ascmhl/ when MHL emit is on) so they don't pollute the manifest or
+    # become candidates for hashing.
     current: Dict[str, Tuple[int, float]] = {}
-    for dirpath, _dirnames, filenames in os.walk(root_path):
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        # Prune ascmhl/ at any depth (matches MHL spec's default ignore).
+        dirnames[:] = [d for d in dirnames if d != "ascmhl"]
         for fn in filenames:
-            # Skip our own SQLite cache (and SQLite's WAL/journal sidecars)
             if fn.startswith(cache.CACHE_FILENAME):
                 continue
             full_path = Path(dirpath) / fn
