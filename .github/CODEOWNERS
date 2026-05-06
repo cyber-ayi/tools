@@ -1,0 +1,8 @@
+# Default reviewer for everything — catches AI-generated PRs that bypass
+# normal review channels. Pair with a branch-protection rule "require review
+# from Code Owners" on `main` for it to be enforced.
+*                       @Jarvie8176
+
+# Workflow files are higher-stakes (run with secrets). Even a small change
+# here warrants explicit owner review.
+/.github/               @Jarvie8176

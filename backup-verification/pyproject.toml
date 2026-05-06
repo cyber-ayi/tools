@@ -10,6 +10,7 @@ python = "^3.8"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"
+pytest-cov = "^5.0"
 
 [tool.poetry.scripts]
 verify = "verify:main"
@@ -22,3 +23,20 @@ build-backend = "poetry.core.masonry.api"
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]
+
+[tool.coverage.run]
+branch = true
+source = ["verify_backup"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+# Threshold reflects current coverage of the core module under unit test.
+# The `verify` runner script is integration-tested manually and intentionally
+# excluded from `source` above. Ratchet this number up as tests grow.
+fail_under = 30
+exclude_also = [
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "pragma: no cover",
+]

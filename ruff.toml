@@ -1,0 +1,28 @@
+# Repo-wide ruff config. Both sub-projects (backup-verification/, rclone-migrate/)
+# inherit this when invoked from the root.
+#
+# The selection is intentionally narrow: rules that catch *real* bugs commonly
+# introduced by AI coding agents (undefined names, broken syntax, unused imports
+# that often hide forgotten edits). Style rules are not enforced here so this
+# CI doesn't have to ride along with a separate formatting initiative.
+
+target-version = "py39"
+
+extend-exclude = [
+    ".venv",
+    ".venv-*",
+    "build",
+    "dist",
+]
+
+[lint]
+# Narrow on purpose: the highest-signal "this is genuinely a bug" rules.
+# Common AI-coding-agent failure modes — hallucinated symbols, broken syntax,
+# imbalanced comparisons — show up here. Unused imports/vars are intentionally
+# excluded; widen later via a follow-up PR after a clean-up pass.
+select = [
+    "E9",   # syntax errors
+    "F63",  # invalid comparison (e.g. `is` with literal)
+    "F7",   # syntax-related (asserts on tuples, etc.)
+    "F82",  # undefined name / undefined export
+]

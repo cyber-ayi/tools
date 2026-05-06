@@ -14,7 +14,10 @@ import hashlib
 import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
+
+if TYPE_CHECKING:
+    import sqlite3
 
 from . import cache as cache_mod
 from . import rclone, state

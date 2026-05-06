@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Detect changed projects
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      backup-verification: ${{ steps.filter.outputs.backup-verification }}
+      rclone-migrate: ${{ steps.filter.outputs.rclone-migrate }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: filter
+        uses: dorny/paths-filter@6852f92c20ea7fd3b0c25de3b5112db3a98da050  # v3
+        with:
+          filters: |
+            backup-verification:
+              - 'backup-verification/**'
+              - '.github/workflows/ci.yml'
+            rclone-migrate:
+              - 'rclone-migrate/**'
+              - '.github/workflows/ci.yml'
+            workflows:
+              - '.github/**'
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install ruff==0.6.9
+      - name: ruff check
+        run: ruff check .
+
+  backup-verification:
+    name: backup-verification (py${{ matrix.python }})
+    needs: changes
+    if: needs.changes.outputs.backup-verification == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    defaults:
+      run:
+        working-directory: backup-verification
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install
+        run: pip install pytest pytest-cov
+      - name: Test with coverage
+        run: |
+          pytest -v \
+            --cov=verify_backup --cov=verify \
+            --cov-branch \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml:coverage.xml \
+            --junitxml=junit.xml
+      - name: Upload coverage artifact
+        if: always() && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-backup-verification
+          path: backup-verification/coverage.xml
+          retention-days: 14
+      - name: Job summary
+        if: always() && matrix.python == '3.12'
+        run: |
+          echo "### backup-verification — coverage" >> "$GITHUB_STEP_SUMMARY"
+          python -c "import xml.etree.ElementTree as ET; r=ET.parse('coverage.xml').getroot(); print(f'Line: {float(r.get(\"line-rate\",0))*100:.1f}%  Branch: {float(r.get(\"branch-rate\",0))*100:.1f}%')" >> "$GITHUB_STEP_SUMMARY"
+
+  rclone-migrate:
+    name: rclone-migrate (py${{ matrix.python }})
+    needs: changes
+    if: needs.changes.outputs.rclone-migrate == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    defaults:
+      run:
+        working-directory: rclone-migrate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install rclone (for e2e tests)
+        run: |
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
+          sudo dpkg -i /tmp/rclone.deb
+          rclone version
+      - name: Install
+        run: pip install -e ".[dev]" pytest-cov
+      - name: Test with coverage
+        run: |
+          pytest -v \
+            --cov=rclone_migrate \
+            --cov-branch \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml:coverage.xml \
+            --junitxml=junit.xml
+      - name: Upload coverage artifact
+        if: always() && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-rclone-migrate
+          path: rclone-migrate/coverage.xml
+          retention-days: 14
+      - name: Job summary
+        if: always() && matrix.python == '3.12'
+        run: |
+          echo "### rclone-migrate — coverage" >> "$GITHUB_STEP_SUMMARY"
+          python -c "import xml.etree.ElementTree as ET; r=ET.parse('coverage.xml').getroot(); print(f'Line: {float(r.get(\"line-rate\",0))*100:.1f}%  Branch: {float(r.get(\"branch-rate\",0))*100:.1f}%')" >> "$GITHUB_STEP_SUMMARY"
+
+  ci-pass:
+    name: CI pass
+    if: always()
+    needs: [lint, backup-verification, rclone-migrate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded or were skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          python3 -c "
+          import json, os, sys
+          r = json.loads(os.environ['RESULTS'])
+          bad = [k for k, v in r.items() if v['result'] not in ('success','skipped')]
+          if bad:
+              print('Failed jobs:', bad); sys.exit(1)
+          print('All required jobs passed or were skipped.')
+          "

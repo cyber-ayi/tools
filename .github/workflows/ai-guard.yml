@@ -1,0 +1,127 @@
+name: AI agent guards
+
+# Guards against the "Comment and Control" prompt-injection attack class
+# (https://oddguan.com/blog/comment-and-control-prompt-injection-credential-theft-claude-code-gemini-cli-github-copilot/)
+# and other AI-coding-agent supply-chain risks. Every check below is static —
+# no LLM, no secrets — so this workflow is itself safe to run on any PR.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-guard-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  actionlint:
+    name: actionlint (workflow syntax & shell safety)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        # Catches `${{ github.event.* }}` interpolated into bash — the exact
+        # pattern that lets a malicious PR title break out of the prompt or
+        # the shell.
+        uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+
+  zizmor:
+    name: zizmor (workflow security audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install zizmor
+      - name: Audit workflows
+        # Static analysis tuned for GitHub Actions: catches template injection,
+        # missing permissions, dangerous triggers (pull_request_target +
+        # checkout of fork code), unpinned third-party actions, etc.
+        run: |
+          zizmor --config .github/zizmor.yml --format sarif .github/workflows > zizmor.sarif || true
+          zizmor --config .github/zizmor.yml --format plain .github/workflows
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+  forbid-pull-request-target:
+    name: Forbid pull_request_target with fork checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Scan for the dangerous pattern
+        # `pull_request_target` runs with repo secrets even on fork PRs.
+        # Combined with `checkout` of the PR head SHA, it executes attacker
+        # code with credentials — the root cause of most prompt-injection
+        # credential-theft incidents in 2026.
+        run: |
+          if grep -RIn --include='*.yml' --include='*.yaml' \
+              -E '^[[:space:]]*(-)?[[:space:]]*pull_request_target' \
+              .github/workflows; then
+              echo "::error::pull_request_target is forbidden — use pull_request instead."
+              echo "If you genuinely need it, gate the workflow with"
+              echo "'if: github.event.pull_request.head.repo.full_name == github.repository'"
+              echo "and remove this guard with a documented justification."
+              exit 1
+          fi
+          echo "OK: no pull_request_target triggers found."
+
+  ai-attribution:
+    name: AI attribution check (informational)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect AI-authored commits and post summary
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Surfaces (does not block) commits that look AI-authored. The goal
+          # is transparency for reviewers, not gating — a human can still
+          # vouch for an AI-assisted commit.
+          range="${BASE_SHA}..${HEAD_SHA}"
+          ai_commits=$(git log --format='%H %s' "$range" \
+            | grep -iE 'co-authored-by:.*(claude|copilot|cursor|gemini|chatgpt|gpt-)|generated with .*(claude|copilot|cursor)' \
+            || true)
+          total=$(git rev-list --count "$range")
+          ai_count=$(printf '%s\n' "$ai_commits" | grep -c . || true)
+          {
+            echo "### AI attribution"
+            echo
+            echo "- Total commits in PR: \`$total\`"
+            echo "- Commits with AI attribution trailers: \`$ai_count\`"
+            if [ "$ai_count" -gt 0 ]; then
+              echo
+              echo "Reviewer note: this PR contains AI-assisted commits. Verify"
+              echo "logic, error handling, and any new third-party imports."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
