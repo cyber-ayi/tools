@@ -1,0 +1,13 @@
+# zizmor (https://woodruffw.github.io/zizmor) audit config.
+#
+# Policy: third-party actions MUST pin to a commit SHA (mitigates the trivy-
+# action / TeamPCP class of supply-chain attack where tags are force-pushed).
+# First-party (`actions/*`, `github/*`) actions are allowed to track major-
+# version tags — GitHub controls the upstream and rotates compromised tags.
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "actions/*": ref-pin
+        "github/*": ref-pin
+        "*": hash-pin
