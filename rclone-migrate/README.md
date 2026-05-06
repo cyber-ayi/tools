@@ -140,8 +140,8 @@ hashes match.
 ## Hash algorithm — automatic
 
 On every run, the tool probes both backends via `rclone backend features`,
-takes the intersection of supported hashes, and picks the strongest from this
-preference order:
+takes the intersection of supported hashes, and picks the highest-priority
+shared algorithm. The default priority is the `balanced` profile:
 
 ```
 SHA256 > SHA1 > MD5 > SHA512 > BLAKE3 > backend-specific (Dropbox, QuickXor, ...)
@@ -157,9 +157,44 @@ Common outcomes:
 | local ↔ OneDrive (business)        | sha1 or sha256 |
 | local ↔ Dropbox                    | dropbox content_hash |
 
-To force: `[defaults] hash = "MD5"` or per-job `hash = "..."`. Forcing an algo
-that a backend doesn't natively expose will error unless you also set
-`download = true` (which fetches bytes to compute it — slow + expensive).
+To force a single algorithm: `[defaults] hash = "MD5"` or per-job
+`hash = "..."`. Forcing an algo that a backend doesn't natively expose
+will error unless you also set `download = true` (which fetches bytes to
+compute it — slow + expensive).
+
+### Profiles — picking a different priority order
+
+Set `hash_profile = "<name>"` to swap the priority list. Built-in profiles:
+
+| Profile        | First algo | Use case                                |
+|----------------|------------|-----------------------------------------|
+| `balanced`     | sha256     | General-purpose; default                |
+| `dit`          | xxh3       | DIT/film/video; MHL-aligned             |
+| `cloud-native` | md5        | Minimize re-hashing across cloud        |
+| `forensic`     | sha256 + md5 multi-hash | Compliance / chain-of-custody |
+
+```toml
+[defaults]
+hash_profile = "dit"             # global
+
+[[jobs]]
+name = "fuji-archive"
+hash_profile = "cloud-native"    # per-job override
+```
+
+Inspect / customize:
+
+```bash
+rmig profiles list               # all profiles + sources
+rmig profiles show dit           # one profile's content
+rmig profiles init dit           # copy bundled to user dir for editing
+rmig profiles validate           # check every reachable profile
+```
+
+User profiles live at `<state_dir>/profiles/<name>.toml` and shadow bundled
+ones of the same name. Inline `[profiles.<name>]` in the job TOML wins over
+both. See [docs/profiles.md](docs/profiles.md) for full schema, three more
+sample profiles (`backup`/`speed`/`compat`), and a comparison matrix.
 
 ### Use the rclone remote, not its fuse mount
 

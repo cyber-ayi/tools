@@ -1,0 +1,8 @@
+description = "DIT / film / video post; MHL v2.0-aligned; speed-first (xxh family)."
+priority = [
+    "xxh3", "xxh128", "xxh64",
+    "sha1", "md5", "c4",
+]
+warnings = [
+    "xxh3/xxh64/xxh128 are non-cryptographic. For jobs with > 1M files, accidental collision probability becomes non-negligible — switch to sha1 or sha256 at that scale.",
+]

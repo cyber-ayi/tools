@@ -246,7 +246,7 @@ def test_cache_persists_across_runs(tmp_path: Path):
     from rclone_migrate import manifest
     from rclone_migrate.ops import _open_state, negotiate_algo
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
 
     m1 = manifest.refresh("src", job, algo, conn, state_dir, progress=False,
                           local_cache_in_root=True)
@@ -283,7 +283,7 @@ def test_size_filter_skips_unrelated_dst_files(tmp_path: Path):
     from rclone_migrate import manifest
     from rclone_migrate.ops import _open_state, negotiate_algo
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
 
     # Pretend src has only sizes {1, 2}; dst should skip the 10000-byte file
     src_size_set = {1, 2}
@@ -351,7 +351,7 @@ def test_cache_invalidates_on_mtime_change(tmp_path: Path):
     from rclone_migrate import manifest
     from rclone_migrate.ops import _open_state, negotiate_algo
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
 
     manifest.refresh("src", job, algo, conn, state_dir, progress=False,
                      local_cache_in_root=True)

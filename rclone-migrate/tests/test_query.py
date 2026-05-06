@@ -60,7 +60,7 @@ def test_file_status_missing(tmp_path: Path):
     from rclone_migrate import manifest, state as state_mod
     from rclone_migrate.ops import _open_state, negotiate_algo
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
     state_mod.meta_set(conn, "hash_algorithm", algo)
     manifest.refresh("src", job, algo, conn, state_dir, progress=False)
     manifest.refresh("dst", job, algo, conn, state_dir, progress=False)
@@ -103,7 +103,7 @@ def test_list_status_filter_missing(tmp_path: Path):
     from rclone_migrate import manifest, state as state_mod
     from rclone_migrate.ops import _open_state, negotiate_algo
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
     state_mod.meta_set(conn, "hash_algorithm", algo)
     manifest.refresh("src", job, algo, conn, state_dir, progress=False)
     manifest.refresh("dst", job, algo, conn, state_dir, progress=False)
@@ -126,7 +126,7 @@ def test_find_by_hash(tmp_path: Path):
     from rclone_migrate import manifest, state as state_mod
     from rclone_migrate.ops import _open_state, negotiate_algo
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
     state_mod.meta_set(conn, "hash_algorithm", algo)
     src_mf = manifest.refresh("src", job, algo, conn, state_dir, progress=False)
     manifest.refresh("dst", job, algo, conn, state_dir, progress=False)

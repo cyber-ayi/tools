@@ -38,11 +38,21 @@ def supported_hashes(path: str) -> List[str]:
     return [h.lower() for h in feats.get("Hashes", [])]
 
 
-def negotiate(src: str, dst: str, override: Optional[str] = None) -> str:
+def negotiate(
+    src: str,
+    dst: str,
+    override: Optional[str] = None,
+    *,
+    priority: Optional[List[str]] = None,
+) -> str:
     """Pick the best hash algorithm shared by both endpoints.
 
     `override` (case-insensitive) forces a specific algorithm; raises if either
     side doesn't list it. Returns rclone's lowercase hash name.
+
+    `priority` overrides the built-in PREFERRED_ORDER for this call (e.g.
+    sourced from a profile). Items missing from the common set are skipped;
+    fall back to PREFERRED_ORDER → any-common if `priority` exhausts.
     """
     src_h = set(supported_hashes(src))
     dst_h = set(supported_hashes(dst))
@@ -67,10 +77,16 @@ def negotiate(src: str, dst: str, override: Optional[str] = None) -> str:
             f"no common hash between src ({sorted(src_h)}) and dst ({sorted(dst_h)})"
         )
 
+    if priority:
+        for cand in priority:
+            c = cand.strip().lower()
+            if c in common:
+                return c
+        # Caller-supplied priority exhausted with no match — fall through to
+        # PREFERRED_ORDER so we still return a usable algo, rather than fail.
     for cand in PREFERRED_ORDER:
         if cand in common:
             return cand
-    # Fall back: any common algorithm
     return sorted(common)[0]
 
 
