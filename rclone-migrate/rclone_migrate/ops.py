@@ -26,9 +26,14 @@ def _join(root: str, rel: str) -> str:
     return f"{root}/{rel}"
 
 
-def negotiate_algo(job: Job, defaults_hash: Optional[str]) -> str:
-    override = job.hash or defaults_hash
-    return hashing.negotiate(job.src, job.dst, override=override)
+def negotiate_algo(job: Job, cfg: Config) -> str:
+    override = job.hash or cfg.defaults.hash
+    if override:
+        # Single-algo override short-circuits profile resolution; profile
+        # warnings are intentionally not surfaced here.
+        return hashing.negotiate(job.src, job.dst, override=override)
+    priority = cfg.resolve_priority(job)
+    return hashing.negotiate(job.src, job.dst, priority=priority)
 
 
 def _open_state(cfg: Config, job: Job) -> Tuple[sqlite3.Connection, Path]:
@@ -57,7 +62,7 @@ def refresh_both(
     if v is None:
         v = verbose_mod.default()
     conn, state_dir = _open_state(cfg, job)
-    algo = negotiate_algo(job, cfg.defaults.hash)
+    algo = negotiate_algo(job, cfg)
     state.meta_set(conn, "hash_algorithm", algo)
     if progress:
         v.info(f"[job={job.name}] hash algorithm = {algo}")

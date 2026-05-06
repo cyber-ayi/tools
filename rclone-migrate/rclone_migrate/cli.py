@@ -16,6 +16,7 @@ from . import __version__
 from . import audit as audit_mod
 from . import config as config_mod
 from . import ops
+from . import profiles as profiles_mod
 from . import query as query_mod
 from . import state as state_mod
 from . import verbose as verbose_mod
@@ -129,7 +130,7 @@ def cmd_hash(argv: Optional[List[str]] = None) -> int:
     with audit_mod.run(state_dir, op="hash") as ev:
         from . import manifest, state
         from .ops import negotiate_algo, _open_state
-        algo = negotiate_algo(job, cfg.defaults.hash)
+        algo = negotiate_algo(job, cfg)
         ev.set_algo(algo)
         total = 0
 
@@ -666,6 +667,174 @@ def _print_jobs_table(rows: list, color: bool) -> None:
         print(f"  {note}")
 
 
+def cmd_profiles(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="rmig profiles",
+        description="Inspect and manage hash profiles.",
+    )
+    sub = p.add_subparsers(dest="action", required=True)
+
+    p_list = sub.add_parser("list", help="List all known profiles with sources")
+    p_list.add_argument("-c", "--config",
+                        help="Include [profiles.*] inline tables from this TOML")
+    p_list.add_argument("--state-dir", default="~/.local/share/rclone-migrate")
+
+    p_show = sub.add_parser("show", help="Show a profile's resolved content")
+    p_show.add_argument("name")
+    p_show.add_argument("-c", "--config",
+                        help="Include [profiles.*] inline tables from this TOML")
+    p_show.add_argument("--state-dir", default="~/.local/share/rclone-migrate")
+
+    p_init = sub.add_parser(
+        "init",
+        help="Copy a bundled profile to <state-dir>/profiles/ for customization",
+    )
+    p_init.add_argument("name", help="Bundled profile name (e.g. dit)")
+    p_init.add_argument("--state-dir", default="~/.local/share/rclone-migrate")
+    p_init.add_argument("--force", action="store_true",
+                        help="Overwrite an existing user profile of the same name")
+
+    p_val = sub.add_parser("validate", help="Validate every reachable profile")
+    p_val.add_argument("-c", "--config",
+                       help="Include [profiles.*] inline tables from this TOML")
+    p_val.add_argument("--state-dir", default="~/.local/share/rclone-migrate")
+
+    args = p.parse_args(argv)
+    if args.action == "list":
+        return _profiles_list(args)
+    if args.action == "show":
+        return _profiles_show(args)
+    if args.action == "init":
+        return _profiles_init(args)
+    if args.action == "validate":
+        return _profiles_validate(args)
+    return 2
+
+
+def _load_inline_profiles(cfg_path: Optional[str]):
+    """Read [profiles.*] tables out of a config file, returning the inline
+    dict (or empty dict on miss / error). Used by `rmig profiles` subcommands
+    that don't otherwise need a fully-validated Config.
+    """
+    if not cfg_path:
+        return {}
+    try:
+        cfg = config_mod.load(cfg_path)
+    except Exception as e:
+        print(f"WARN: could not load -c {cfg_path}: {e}", file=sys.stderr)
+        return {}
+    return cfg.inline_profiles
+
+
+def _profiles_list(args) -> int:
+    state_dir = Path(os.path.expanduser(args.state_dir))
+    inline = _load_inline_profiles(args.config)
+    profs = profiles_mod.list_all(state_dir=state_dir, inline=inline or None)
+    if not profs:
+        print("(no profiles found)")
+        return 0
+    bundled = set(profiles_mod.list_bundled())
+    name_w = max(4, max(len(p.name) for p in profs))
+    src_w = max(6, max(len(p.source) for p in profs))
+    print(f"{'NAME':<{name_w}}  {'SOURCE':<{src_w}}  MHL  DESCRIPTION")
+    print("-" * (name_w + src_w + 30))
+    for prof in profs:
+        mhl_ok = _profile_mhl_compatible(prof)
+        ann = ""
+        if prof.source != "bundled" and prof.name in bundled:
+            ann = "  [overrides bundled]"
+        desc = prof.description or "(no description)"
+        print(f"{prof.name:<{name_w}}  {prof.source:<{src_w}}  "
+              f"{'✓' if mhl_ok else '✗':<3}  {desc}{ann}")
+    return 0
+
+
+def _profiles_show(args) -> int:
+    state_dir = Path(os.path.expanduser(args.state_dir))
+    inline = _load_inline_profiles(args.config)
+    try:
+        prof = profiles_mod.load(
+            args.name, state_dir=state_dir, inline=inline or None,
+        )
+    except profiles_mod.ProfileError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print(f"name        {prof.name}")
+    print(f"source      {prof.source}")
+    print(f"description {prof.description or '(none)'}")
+    print(f"priority    {prof.priority}")
+    if prof.multi_hash:
+        print(f"multi_hash  {prof.multi_hash}")
+    if prof.warnings:
+        print("warnings:")
+        for w in prof.warnings:
+            print(f"  - {w}")
+    print(f"mhl_compatible  {_profile_mhl_compatible(prof)}")
+    return 0
+
+
+def _profiles_init(args) -> int:
+    bundled_dir = Path(profiles_mod.__file__).parent / "profiles"
+    src = bundled_dir / f"{args.name}.toml"
+    if not src.is_file():
+        print(
+            f"ERROR: no bundled profile named '{args.name}'.\n"
+            f"Bundled: {', '.join(profiles_mod.list_bundled()) or '(none)'}",
+            file=sys.stderr,
+        )
+        return 1
+    state_dir = Path(os.path.expanduser(args.state_dir))
+    dst_dir = state_dir / "profiles"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / f"{args.name}.toml"
+    if dst.exists() and not args.force:
+        print(
+            f"ERROR: {dst} already exists. Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        return 1
+    import shutil
+    shutil.copyfile(src, dst)
+    print(f"wrote {dst}")
+    print(f"edit it to customize; rmig will load this in preference to bundled.")
+    return 0
+
+
+def _profiles_validate(args) -> int:
+    state_dir = Path(os.path.expanduser(args.state_dir))
+    inline = _load_inline_profiles(args.config)
+    failures = 0
+    sources = []
+    for name in profiles_mod.list_bundled():
+        sources.append((name, "bundled"))
+    for name in profiles_mod.list_user(state_dir):
+        sources.append((name, f"user ({state_dir / 'profiles' / (name + '.toml')})"))
+    for name in inline or {}:
+        sources.append((name, "inline"))
+    if not sources:
+        print("(no profiles to validate)")
+        return 0
+    for name, source in sources:
+        try:
+            if source == "inline":
+                profiles_mod.load(name, state_dir=state_dir, inline=inline)
+            elif source == "bundled":
+                profiles_mod.load(name)  # bundled-only path
+            else:
+                profiles_mod.load(name, state_dir=state_dir)
+            print(f"  ok    {name:<20} ({source})")
+        except profiles_mod.ProfileError as e:
+            print(f"  FAIL  {name:<20} ({source}): {e}")
+            failures += 1
+    return 1 if failures else 0
+
+
+def _profile_mhl_compatible(prof) -> bool:
+    """True iff every algo in priority + multi_hash is in the MHL v2.0 set."""
+    mhl_set = {"c4", "md5", "sha1", "xxh64", "xxh3", "xxh128"}
+    return all(a in mhl_set for a in (prof.priority + prof.multi_hash))
+
+
 def cmd_delete(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="rmig-delete",
@@ -711,8 +880,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         sys.exit(0)
     if not argv or argv[0] in ("-h", "--help"):
         print(
-            "usage: rmig {init|hash|copy|check|delete|list-jobs|log|file-status} "
-            "[options]\n"
+            "usage: rmig {init|hash|copy|check|delete|list-jobs|log|"
+            "file-status|profiles} [options]\n"
             "       rmig --version",
             file=sys.stderr,
         )
@@ -723,7 +892,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "hash": cmd_hash, "copy": cmd_copy, "check": cmd_check,
         "delete": cmd_delete, "list-jobs": cmd_list_jobs,
         "log": cmd_log, "file-status": cmd_file_status,
-        "init": cmd_init,
+        "init": cmd_init, "profiles": cmd_profiles,
     }
     if sub not in table:
         print(f"unknown subcommand: {sub}", file=sys.stderr)

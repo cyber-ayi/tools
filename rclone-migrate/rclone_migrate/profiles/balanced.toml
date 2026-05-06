@@ -1,0 +1,6 @@
+description = "Security-leaning default; broadly compatible across rclone backends."
+priority = [
+    "sha256", "sha1", "md5", "sha512", "blake3",
+    "xxh128", "xxh3", "crc32",
+    "dropbox", "quickxor", "whirlpool",
+]

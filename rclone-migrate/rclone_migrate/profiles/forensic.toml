@@ -1,0 +1,6 @@
+description = "Chain-of-custody / compliance: SHA-256 primary, MD5 secondary for cross-tool compatibility."
+priority = [
+    "sha256", "sha512", "sha1",
+    "c4", "md5",
+]
+multi_hash = ["md5"]
