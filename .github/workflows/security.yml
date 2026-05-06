@@ -25,7 +25,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        project: [backup-verification, rclone-migrate]
+        # backup-verification uses Poetry's legacy `[tool.poetry]` (no PEP 621
+        # `[project]` block), which pip-audit can't read directly. It also has
+        # no runtime deps — only `python = ^3.8` — so there's nothing to audit.
+        # Re-add it to the matrix once it migrates to PEP 621 (or the Poetry
+        # plugin lands in pip-audit).
+        project: [rclone-migrate]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,11 +42,10 @@ jobs:
         run: pip install pip-audit
       - name: Audit ${{ matrix.project }}
         working-directory: ${{ matrix.project }}
-        run: |
-          # PEP 621 / Poetry both expose deps via pyproject; pip-audit reads it directly.
-          pip-audit --strict --disable-pip --desc --format json --output audit.json . || EXIT=$?
-          pip-audit --strict --disable-pip --desc . || true
-          exit ${EXIT:-0}
+        # pip-audit reads PEP 621 deps from pyproject.toml directly.
+        # `--strict` makes the run fail on any vulnerability; the JSON artifact
+        # is uploaded below for triage.
+        run: pip-audit --strict --format json --output audit.json .
       - name: Upload audit JSON
         if: always()
         uses: actions/upload-artifact@v4
