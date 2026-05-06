@@ -1,0 +1,27 @@
+# Packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Local config (may contain secrets / local paths)
+config.toml
+*.local.toml
+
+# State / runtime data
+*.db
+*.db-wal
+*.db-shm
+state/
+logs/

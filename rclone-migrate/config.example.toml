@@ -1,0 +1,35 @@
+# rclone-migrate config — copy → check → delete with persistent checksums.
+
+[defaults]
+# hash = "MD5"                       # uncomment to force; otherwise auto-negotiated
+# Auto-negotiation prefers SHA256 > SHA1 > MD5, restricted to algorithms that
+# both src and dst backends natively expose. Local↔local picks SHA256;
+# local↔S3 picks MD5; local↔B2 picks SHA1.
+
+state_dir  = "~/.local/share/rclone-migrate"
+transfers  = 8
+checkers   = 16
+download   = false                   # true → for remotes that don't store the
+                                     # negotiated hash, fetch bytes to compute it
+local_cache_in_root = true           # cache lives at <root>/.rmig-cache.db
+                                     # (false → centralized under state_dir)
+
+[delete]
+require_check_within = "24h"         # delete must happen within this of last check
+remove_empty_src_dirs = true
+require_confirm = true               # without --confirm, delete is dry-run
+
+# ---- jobs ----
+
+[[jobs]]
+name    = "fuji-archive"
+src     = "/Volumes/SDCard/DCIM"
+dst     = "b2:photos/fuji"
+enabled = true
+
+[[jobs]]
+name    = "audio-archive"
+src     = "/Users/me/backup/audio"
+dst     = "/Volumes/NAS/audio"
+hash    = "SHA256"                   # both sides local → strong hash worth it
+transfers = 4

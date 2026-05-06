@@ -1,0 +1,415 @@
+"""Three top-level operations: copy, check, delete.
+
+Glue between Manifest (data layer) and rclone (action layer), plus the
+state.db meta bookkeeping that gates delete on a successful prior check.
+"""
+from __future__ import annotations
+
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from . import audit, hashing, manifest, rclone, state
+from . import verbose as verbose_mod
+from .config import Config, Job
+
+
+# --- helpers ---------------------------------------------------------------
+
+def _join(root: str, rel: str) -> str:
+    """Join a remote-or-local root with a relative path."""
+    if root.endswith("/") or root.endswith(":"):
+        return f"{root}{rel}"
+    # rclone treats both `local/file` and `remote:path/file` the same way
+    return f"{root}/{rel}"
+
+
+def negotiate_algo(job: Job, defaults_hash: Optional[str]) -> str:
+    override = job.hash or defaults_hash
+    return hashing.negotiate(job.src, job.dst, override=override)
+
+
+def _open_state(cfg: Config, job: Job) -> Tuple[sqlite3.Connection, Path]:
+    state_dir = cfg.state_dir_for(job)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state.open_db(state_dir), state_dir
+
+
+def refresh_both(
+    cfg: Config, job: Job, *,
+    full: bool = False, progress: bool = True,
+    filter_dst_by_src_size: bool = True,
+    v: Optional[verbose_mod.Verbose] = None,
+) -> Tuple[manifest.Manifest, manifest.Manifest, str, sqlite3.Connection, Path]:
+    """Refresh src then dst manifests.
+
+    `filter_dst_by_src_size`: when True (default), the dst refresh only
+    hashes files whose size matches some src file. This is correct for
+    copy/check/delete because a hash collision across non-matching sizes
+    is impossible — so dst files outside the src size set can't possibly
+    match any src file. Critical when dst >> src (verify a small SD card
+    against a large NAS archive).
+
+    Set False when you want a full dst manifest (e.g. for inventory).
+    """
+    if v is None:
+        v = verbose_mod.default()
+    conn, state_dir = _open_state(cfg, job)
+    algo = negotiate_algo(job, cfg.defaults.hash)
+    state.meta_set(conn, "hash_algorithm", algo)
+    if progress:
+        v.info(f"[job={job.name}] hash algorithm = {algo}")
+    if v.is_detail():
+        v.detail(f"  src backend: {job.src}")
+        v.detail(f"  dst backend: {job.dst}")
+
+    with v.phase("refresh src"):
+        src_mf = manifest.refresh(
+            "src", job, algo, conn, state_dir,
+            transfers=job.resolved_transfers(cfg.defaults),
+            download=job.resolved_download(cfg.defaults),
+            full=full,
+            local_cache_in_root=job.resolved_local_cache_in_root(cfg.defaults),
+            progress=progress,
+            v=v,
+        )
+    src_size_set = {e.size for e in src_mf.entries} if filter_dst_by_src_size else None
+    if progress and src_size_set is not None:
+        v.info(f"[refresh] src size set: {len(src_size_set)} unique sizes")
+
+    with v.phase("refresh dst"):
+        dst_mf = manifest.refresh(
+            "dst", job, algo, conn, state_dir,
+            transfers=job.resolved_transfers(cfg.defaults),
+            download=job.resolved_download(cfg.defaults),
+            full=full,
+            local_cache_in_root=job.resolved_local_cache_in_root(cfg.defaults),
+            progress=progress,
+            size_filter=src_size_set,
+            v=v,
+        )
+    return src_mf, dst_mf, algo, conn, state_dir
+
+
+# --- operations ------------------------------------------------------------
+
+@dataclass
+class CopyPlan:
+    to_copy: List[manifest.Entry]   # one representative per missing hash
+    src_total: int
+    dst_total: int
+
+
+def plan_copy(src_mf: manifest.Manifest, dst_mf: manifest.Manifest) -> CopyPlan:
+    dst_hashes = dst_mf.hash_set()
+    to_copy = [e for e in src_mf.unique_by_hash() if e.hash not in dst_hashes]
+    return CopyPlan(to_copy=to_copy, src_total=len(src_mf.entries),
+                    dst_total=len(dst_mf.entries))
+
+
+def do_copy(
+    cfg: Config,
+    job: Job,
+    *,
+    no_refresh: bool = False,
+    full: bool = False,
+    dry_run: bool = False,
+    progress: bool = True,
+    v: Optional[verbose_mod.Verbose] = None,
+) -> int:
+    """Returns 0 on success, non-zero if any individual copy failed."""
+    if v is None:
+        v = verbose_mod.default()
+    state_dir = cfg.state_dir_for(job)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    op_name = "copy-dry" if dry_run else "copy"
+    with audit.run(state_dir, op=op_name) as ev:
+        src_mf, dst_mf, algo, conn, _state_dir = refresh_both(
+            cfg, job, full=full, progress=progress, v=v,
+        )
+        ev.set_algo(algo)
+
+        plan = plan_copy(src_mf, dst_mf)
+        ev.set_counts(src=plan.src_total, dst=plan.dst_total)
+        if progress:
+            v.info(
+                f"\n[copy] src={plan.src_total} dst={plan.dst_total} "
+                f"to_copy={len(plan.to_copy)} (algo={algo})"
+            )
+
+        if not plan.to_copy:
+            state.meta_set(conn, "last_copy_ts", str(time.time()))
+            ev.set_counts(affected=0)
+            ev.set_result("ok")
+            conn.close()
+            return 0
+
+        failures = 0
+        copied_dst_paths: List[str] = []
+        transfers = job.resolved_transfers(cfg.defaults)
+        extra: List[str] = []
+        if job.resolved_download(cfg.defaults):
+            extra.append("--download")
+
+        with v.phase(f"copy {len(plan.to_copy)} files"):
+            for i, ent in enumerate(plan.to_copy, 1):
+                src_full = _join(job.src, ent.path)
+                dst_full = _join(job.dst, ent.path)
+                if dry_run:
+                    v.info(f"  DRY [{i}/{len(plan.to_copy)}] {ent.path}  ({ent.hash})")
+                    continue
+                if progress:
+                    v.info(f"  [{i}/{len(plan.to_copy)}] {ent.path}")
+                v.detail(f"    rclone copyto {src_full} {dst_full}")
+                try:
+                    rclone.copyto(src_full, dst_full, algo, transfers=transfers, extra=extra)
+                    copied_dst_paths.append(ent.path)
+                    ev.record_file("dst", ent.path, outcome="copied", hash=ent.hash)
+                except rclone.RcloneError as e:
+                    failures += 1
+                    v.error(f"    FAIL: {e}")
+                    ev.record_file("dst", ent.path, outcome="failed",
+                                   hash=ent.hash, detail=str(e))
+
+        if not dry_run and copied_dst_paths:
+            # Update local-side dst cache so next run sees these without full rescan
+            manifest.append_to_local_cache(
+                job, "dst", copied_dst_paths, algo, state_dir,
+                local_cache_in_root=job.resolved_local_cache_in_root(cfg.defaults),
+            )
+
+        ev.set_counts(affected=len(copied_dst_paths))
+        if dry_run:
+            ev.set_result("ok")
+        elif failures == 0:
+            ev.set_result("ok")
+        elif copied_dst_paths:
+            ev.set_result("partial")
+        else:
+            ev.set_result("fail")
+
+        state.meta_set(conn, "last_copy_ts", str(time.time()))
+        # check_signature is invalidated whenever copy runs (src may have changed)
+        state.meta_clear(conn, "check_signature")
+        conn.close()
+        return 0 if failures == 0 else 1
+
+
+@dataclass
+class CheckResult:
+    ok: bool
+    missing: List[manifest.Entry]
+    src_total: int
+    dst_total: int
+    signature: Optional[str]
+
+
+def plan_check(
+    src_mf: manifest.Manifest, dst_mf: manifest.Manifest
+) -> CheckResult:
+    dst_hashes = dst_mf.hash_set()
+    missing = [e for e in src_mf.entries if e.hash not in dst_hashes]
+    return CheckResult(
+        ok=(len(missing) == 0),
+        missing=missing,
+        src_total=len(src_mf.entries),
+        dst_total=len(dst_mf.entries),
+        signature=src_mf.signature() if not missing else None,
+    )
+
+
+def do_check(
+    cfg: Config,
+    job: Job,
+    *,
+    rehash_all: bool = False,
+    progress: bool = True,
+    v: Optional[verbose_mod.Verbose] = None,
+) -> int:
+    if v is None:
+        v = verbose_mod.default()
+    state_dir = cfg.state_dir_for(job)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with audit.run(state_dir, op="check") as ev:
+        src_mf, dst_mf, algo, conn, _state_dir = refresh_both(
+            cfg, job, full=rehash_all, progress=progress, v=v,
+        )
+        ev.set_algo(algo)
+        result = plan_check(src_mf, dst_mf)
+        ev.set_counts(src=result.src_total, dst=result.dst_total,
+                      affected=len(result.missing))
+
+        if progress:
+            v.info(
+                f"\n[check] src={result.src_total} dst={result.dst_total} "
+                f"missing={len(result.missing)} (algo={algo})"
+            )
+
+        if not result.ok:
+            v.info("\nMISSING (src files whose hash is absent from dst):")
+            for e in result.missing[:50]:
+                v.info(f"  {e.path}   {e.hash}")
+                ev.record_file("src", e.path, outcome="missing", hash=e.hash)
+            for e in result.missing[50:]:
+                ev.record_file("src", e.path, outcome="missing", hash=e.hash)
+            if len(result.missing) > 50:
+                v.info(f"  ... and {len(result.missing) - 50} more")
+            state.meta_clear(conn, "check_signature")
+            conn.close()
+            ev.set_result("fail")
+            return 1
+
+        state.meta_set(conn, "check_signature", result.signature or "")
+        state.meta_set(conn, "last_check_ts", str(time.time()))
+        conn.close()
+        v.ok(f"\nOK: signature = {result.signature}")
+        ev.set_signature(result.signature)
+        ev.set_result("ok")
+        return 0
+
+
+def do_delete(
+    cfg: Config,
+    job: Job,
+    *,
+    confirm: bool = False,
+    progress: bool = True,
+    v: Optional[verbose_mod.Verbose] = None,
+) -> int:
+    if v is None:
+        v = verbose_mod.default()
+    sd = cfg.state_dir_for(job)
+    sd.mkdir(parents=True, exist_ok=True)
+    op_name = "delete" if confirm else "delete-dry"
+    with audit.run(sd, op=op_name) as ev:
+        return _do_delete_inner(cfg, job, confirm=confirm, progress=progress,
+                                ev=ev, v=v)
+
+
+def _do_delete_inner(cfg, job, *, confirm, progress, ev, v):
+    src_mf, dst_mf, algo, conn, state_dir = refresh_both(
+        cfg, job, full=False, progress=progress, v=v,
+    )
+    ev.set_algo(algo)
+
+    saved_sig = state.meta_get(conn, "check_signature")
+    saved_algo = state.meta_get(conn, "hash_algorithm")
+    last_check_s = state.meta_get(conn, "last_check_ts")
+
+    if not saved_sig:
+        v.error("REFUSE: no check_signature in state. Run rmig-check first.")
+        conn.close()
+        ev.set_result("refused")
+        ev.set_notes("no check_signature in state")
+        return 2
+
+    cur_sig = src_mf.signature()
+    if cur_sig != saved_sig:
+        # Distinguish between "src changed" and "hash algorithm changed".
+        algo_hint = ""
+        if saved_algo and saved_algo != algo:
+            algo_hint = (
+                f"\nNote: saved signature was computed with hash={saved_algo}, "
+                f"but current run uses hash={algo}. If you switched the hash "
+                "algorithm (or dst backend), re-run rmig-check before deleting."
+            )
+        v.error(
+            f"REFUSE: src signature changed since last check.\n"
+            f"  saved   = {saved_sig}\n  current = {cur_sig}\n"
+            f"Run rmig-check again.{algo_hint}"
+        )
+        conn.close()
+        ev.set_result("refused")
+        ev.set_notes(f"signature mismatch: saved={saved_sig} current={cur_sig}")
+        return 2
+
+    if last_check_s:
+        age = time.time() - float(last_check_s)
+        if age > cfg.delete.require_check_within_s:
+            v.error(
+                f"REFUSE: last check is {age:.0f}s old "
+                f"(> {cfg.delete.require_check_within_s:.0f}s). "
+                "Run rmig-check again."
+            )
+            conn.close()
+            ev.set_result("refused")
+            ev.set_notes(f"check too old: {age:.0f}s")
+            return 2
+
+    dst_hashes = dst_mf.hash_set()
+    to_delete = [e for e in src_mf.entries if e.hash in dst_hashes]
+    ev.set_counts(src=len(src_mf.entries), dst=len(dst_mf.entries))
+
+    if progress:
+        v.info(
+            f"\n[delete] src={len(src_mf.entries)} "
+            f"to_delete={len(to_delete)} (algo={algo})"
+        )
+
+    require_confirm = cfg.delete.require_confirm
+    if (require_confirm and not confirm):
+        v.info("\nDRY-RUN (pass --confirm to actually delete):")
+        for e in to_delete[:50]:
+            v.info(f"  {e.path}   {e.hash}")
+        if len(to_delete) > 50:
+            v.info(f"  ... and {len(to_delete) - 50} more")
+        conn.close()
+        ev.set_counts(affected=0)
+        ev.set_result("ok")
+        ev.set_notes(f"dry-run: would delete {len(to_delete)} files")
+        return 0
+
+    failures = 0
+    deleted_paths: List[str] = []
+    with v.phase(f"delete {len(to_delete)} files"):
+        for i, ent in enumerate(to_delete, 1):
+            full = _join(job.src, ent.path)
+            if progress:
+                v.info(f"  [{i}/{len(to_delete)}] del {ent.path}")
+            v.detail(f"    rclone deletefile {full}")
+            try:
+                rclone.deletefile(full)
+                deleted_paths.append(ent.path)
+                ev.record_file("src", ent.path, outcome="deleted", hash=ent.hash)
+            except rclone.RcloneError as e:
+                failures += 1
+                v.error(f"    FAIL: {e}")
+                ev.record_file("src", ent.path, outcome="failed",
+                               hash=ent.hash, detail=str(e))
+
+    # Remove deleted entries from src local cache
+    if deleted_paths and rclone.is_local(job.src):
+        from . import cache as cache_mod
+        root_path = Path(__import__("os").path.expanduser(job.src))
+        fallback = state_dir / "local-cache"
+        in_root = job.resolved_local_cache_in_root(cfg.defaults)
+        if in_root:
+            db_path = cache_mod.cache_path_for_root(root_path, fallback_dir=fallback)
+        else:
+            import hashlib as _hl
+            digest = _hl.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
+            db_path = fallback / f"cache-{digest}.db"
+        if db_path.exists():
+            cc = cache_mod.open_db(db_path)
+            cache_mod.delete_paths(cc, deleted_paths)
+            cc.close()
+
+    if cfg.delete.remove_empty_src_dirs:
+        try:
+            rclone.rmdirs(job.src, leave_root=True)
+        except rclone.RcloneError as e:
+            print(f"  rmdirs warning: {e}")
+
+    # signature is invalid after delete (src changed)
+    state.meta_clear(conn, "check_signature")
+    conn.close()
+    ev.set_counts(affected=len(deleted_paths))
+    if failures == 0:
+        ev.set_result("ok")
+    elif deleted_paths:
+        ev.set_result("partial")
+    else:
+        ev.set_result("fail")
+    return 0 if failures == 0 else 1
