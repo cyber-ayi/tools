@@ -1,0 +1,155 @@
+name: Release rclone-migrate
+
+# Triggered by pushing a tag of the form `rclone-migrate-vX.Y.Z`. Builds the
+# wheel + sdist, generates SHA256SUMS, signs everything with sigstore (keyless,
+# OIDC-bound to this workflow), and creates a GitHub Release with the bundle.
+#
+# Tag-prefix scheme lets a future `release-backup-verification.yml` use
+# `backup-verification-vX.Y.Z` without colliding.
+
+on:
+  push:
+    tags: ['rclone-migrate-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build, e.g. rclone-migrate-v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build + sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write  # required for sigstore keyless signing via OIDC
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve tag and version
+        id: version
+        env:
+          REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ref="${REF#refs/tags/}"
+          if [[ "$ref" != rclone-migrate-v* ]]; then
+            echo "::error::Tag '$ref' must start with 'rclone-migrate-v'"
+            exit 1
+          fi
+          version="${ref#rclone-migrate-v}"
+          {
+            echo "tag=$ref"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tag: $ref → version: $version"
+
+      - name: Verify pyproject.toml version matches tag
+        working-directory: rclone-migrate
+        env:
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          actual=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::pyproject.toml version ($actual) != tag version ($EXPECTED)"
+            exit 1
+          fi
+          echo "Version match: $actual"
+
+      - name: Verify __init__.py __version__ matches tag
+        working-directory: rclone-migrate
+        env:
+          EXPECTED: ${{ steps.version.outputs.version }}
+        run: |
+          actual=$(python -c "from rclone_migrate import __version__; print(__version__)")
+          if [ "$actual" != "$EXPECTED" ]; then
+            echo "::error::rclone_migrate.__version__ ($actual) != tag version ($EXPECTED)"
+            exit 1
+          fi
+          echo "Version match: $actual"
+
+      - name: Build sdist + wheel
+        working-directory: rclone-migrate
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+          ls -la dist/
+
+      - name: Generate SHA256SUMS
+        working-directory: rclone-migrate/dist
+        run: |
+          sha256sum ./*.whl ./*.tar.gz | sed 's| \./|  |' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign artifacts (sigstore keyless)
+        # Produces a `<artifact>.sigstore` bundle file per input — verifiable
+        # later via `python -m sigstore verify identity`.
+        uses: sigstore/gh-action-sigstore-python@04cffa1d795717b140764e8b640de88853c92acc  # v3.3.0
+        with:
+          inputs: |
+            rclone-migrate/dist/*.whl
+            rclone-migrate/dist/*.tar.gz
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-migrate-dist
+          path: |
+            rclone-migrate/dist/*.whl
+            rclone-migrate/dist/*.tar.gz
+            rclone-migrate/dist/SHA256SUMS
+            rclone-migrate/dist/*.sigstore
+            rclone-migrate/dist/*.sigstore.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write  # creating a release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rclone-migrate-dist
+          path: dist
+
+      - name: Sanity-check artifacts
+        run: |
+          ls -la dist/
+          test -f dist/SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          # If the release already exists (e.g. re-run), upload assets instead
+          # of failing — lets you patch artifacts without recreating the tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading assets with --clobber."
+            gh release upload "$TAG" --clobber dist/*.whl dist/*.tar.gz dist/SHA256SUMS dist/*.sigstore* 2>/dev/null
+          else
+            gh release create "$TAG" \
+              --title "rclone-migrate $VERSION" \
+              --generate-notes \
+              dist/*.whl dist/*.tar.gz dist/SHA256SUMS dist/*.sigstore*
+          fi

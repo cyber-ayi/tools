@@ -36,6 +36,29 @@ jobs:
         with:
           args: -color
 
+  shellcheck:
+    name: shellcheck (shell scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run shellcheck on tracked *.sh files
+        # actionlint already lints inline `run:` blocks in workflows. This
+        # job covers the standalone shell scripts we ship to users
+        # (rclone-migrate/scripts/*.sh) — those run on the user's machine
+        # with whatever shell they have, so static analysis is doubly
+        # important. shellcheck is preinstalled on ubuntu-latest runners.
+        run: |
+          mapfile -t scripts < <(find . -type f -name '*.sh' -not -path './.git/*')
+          if [ ${#scripts[@]} -eq 0 ]; then
+            echo "No *.sh files found."
+            exit 0
+          fi
+          printf 'Linting:\n'; printf '  %s\n' "${scripts[@]}"
+          shellcheck --severity=warning --shell=bash "${scripts[@]}"
+
   zizmor:
     name: zizmor (workflow security audit)
     runs-on: ubuntu-latest
