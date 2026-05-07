@@ -48,18 +48,30 @@ curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/rclone-migrat
 
 Every release artifact is signed via [Sigstore](https://www.sigstore.dev/)
 keylessly, bound to the build workflow's OIDC identity. To verify a wheel
-came from this repo's release workflow:
+came from this repo's release workflow, download **both** the wheel and its
+`.sigstore.json` bundle from the [GitHub Release page][releases]:
 
 ```bash
+VERSION=0.1.0   # the release you want to verify
+TAG="rclone-migrate-v${VERSION}"
+BASE="https://github.com/Jarvie8176/tools/releases/download/${TAG}"
+
+curl -fsSL -O "${BASE}/rclone_migrate-${VERSION}-py3-none-any.whl"
+curl -fsSL -O "${BASE}/rclone_migrate-${VERSION}-py3-none-any.whl.sigstore.json"
+
 pip install sigstore
 python -m sigstore verify identity \
-    --cert-identity 'https://github.com/Jarvie8176/tools/.github/workflows/release-rclone-migrate.yml@refs/tags/rclone-migrate-vX.Y.Z' \
+    --bundle "rclone_migrate-${VERSION}-py3-none-any.whl.sigstore.json" \
+    --cert-identity "https://github.com/Jarvie8176/tools/.github/workflows/release-rclone-migrate.yml@refs/tags/${TAG}" \
     --cert-oidc-issuer 'https://token.actions.githubusercontent.com' \
-    rclone_migrate-X.Y.Z-py3-none-any.whl
+    "rclone_migrate-${VERSION}-py3-none-any.whl"
 ```
 
-Substitute the actual `X.Y.Z`. A non-zero exit means the wheel is not
-genuinely from this repo's release workflow — do not install it.
+A successful run prints `OK: rclone_migrate-...whl` and exits 0. A non-zero
+exit means the wheel is not genuinely from this repo's release workflow —
+**do not install it**.
+
+[releases]: https://github.com/Jarvie8176/tools/releases
 
 ### Requirements
 
