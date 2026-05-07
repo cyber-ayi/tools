@@ -5,6 +5,10 @@ description = "Safe rclone migration with copy → check → delete and persiste
 requires-python = ">=3.9"
 dependencies = [
     "tomli; python_version < '3.11'",
+    # parse_chain reads `ascmhl_chain.xml`, which may be written by
+    # third-party MHL tools — defuse against XML attacks (entity
+    # expansion, external entity resolution).
+    "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]

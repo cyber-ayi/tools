@@ -29,6 +29,12 @@ from pathlib import Path
 from typing import List, Optional
 from xml.etree import ElementTree as ET
 
+# `defusedxml` shields parse_chain from XML attacks (entity expansion,
+# external entity resolution) when the chain file is written by an
+# external tool. ET is still used for *emitting* — the writer side
+# never touches user-controlled data through the parser.
+from defusedxml.ElementTree import fromstring as _safe_fromstring
+
 from . import __version__
 
 NS_MANIFEST = "urn:ASC:MHL:v2.0"
@@ -292,8 +298,13 @@ def _serialize(root: ET.Element) -> bytes:
 # --- Parsing (chain only — manifest parsing is delegated to ascmhl) ----------
 
 def parse_chain(xml_bytes: bytes) -> List[ChainEntry]:
-    """Parse an existing ascmhl_chain.xml into a sorted ChainEntry list."""
-    root = ET.fromstring(xml_bytes)
+    """Parse an existing ascmhl_chain.xml into a sorted ChainEntry list.
+
+    Uses defusedxml because the chain file may have been written by a
+    third-party tool (Silverstack / Hedge / `ascmhl`) sharing the same
+    `ascmhl/` directory.
+    """
+    root = _safe_fromstring(xml_bytes)
     out = []
     for hl in root.findall(f"{{{NS_DIRECTORY}}}hashlist"):
         try:
