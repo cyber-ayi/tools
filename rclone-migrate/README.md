@@ -8,6 +8,67 @@ Sister tool of [`backup-verification/`](../backup-verification/) — same SQLite
 caching pattern, same hash-based matching idea, different goal (migration vs.
 verification).
 
+## Install
+
+One-liner:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/rclone-migrate/scripts/install.sh | bash
+```
+
+Audited form (recommended — read the script before running it):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/rclone-migrate/scripts/install.sh -o install.sh
+less install.sh
+bash install.sh
+```
+
+The installer:
+
+1. Verifies you have Python ≥ 3.9 on `PATH`
+2. Installs [`pipx`](https://pipx.pypa.io/) into your user dir if missing
+3. Downloads the wheel + `SHA256SUMS` from the latest GitHub Release
+4. Verifies the wheel's SHA-256
+5. Installs `rmig` (and its `rmig-*` subcommands) via `pipx`
+
+Pin a specific version:
+
+```bash
+bash install.sh --version 0.1.0
+```
+
+Uninstall (preserves user state in `${XDG_DATA_HOME:-~/.local/share}/rclone-migrate/`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/rclone-migrate/scripts/uninstall.sh | bash
+```
+
+### Verify the signature (optional)
+
+Every release artifact is signed via [Sigstore](https://www.sigstore.dev/)
+keylessly, bound to the build workflow's OIDC identity. To verify a wheel
+came from this repo's release workflow:
+
+```bash
+pip install sigstore
+python -m sigstore verify identity \
+    --cert-identity 'https://github.com/Jarvie8176/tools/.github/workflows/release-rclone-migrate.yml@refs/tags/rclone-migrate-vX.Y.Z' \
+    --cert-oidc-issuer 'https://token.actions.githubusercontent.com' \
+    rclone_migrate-X.Y.Z-py3-none-any.whl
+```
+
+Substitute the actual `X.Y.Z`. A non-zero exit means the wheel is not
+genuinely from this repo's release workflow — do not install it.
+
+### Requirements
+
+- macOS or Linux. Windows is not covered by the installer; install
+  manually with `pipx install rclone-migrate-<X.Y.Z>.whl` from a
+  GitHub Release wheel.
+- Python ≥ 3.9
+- [`rclone`](https://rclone.org/downloads/) on `PATH`
+
 ## When to use
 
 You want to move files from src → dst, but:
