@@ -269,6 +269,36 @@ ones of the same name. Inline `[profiles.<name>]` in the job TOML wins over
 both. See [docs/profiles.md](docs/profiles.md) for full schema, three more
 sample profiles (`backup`/`speed`/`compat`), and a comparison matrix.
 
+## ASC MHL v2.0 output (opt-in)
+
+Set `emit_mhl = true` in `[defaults]` or per-job to make rmig write
+[ASC MHL v2.0](https://github.com/ascmitc/mhl-specification) generation
+files alongside data — the same format used by Silverstack / Hedge /
+ShotPut Pro. Each successful `hash` / `check` / `copy` writes one
+generation under `<root>/ascmhl/`:
+
+```toml
+[defaults]
+hash_profile = "dit"            # MHL-aligned algorithms (xxh family)
+emit_mhl     = true
+mhl_author   = "Me <me@example.com>"
+```
+
+```bash
+rmig export-mhl -j JOB           # also: explicitly emit from current cache
+```
+
+When emit is on, the priority list is filtered to MHL-compatible algos
+(`c4`/`md5`/`sha1`/`xxh3`/`xxh64`/`xxh128`) so the negotiated algorithm is
+guaranteed emittable. Independent verification with the official tool:
+
+```bash
+pip install ascmhl && ascmhl verify <root>
+```
+
+See [docs/mhl-integration.md](docs/mhl-integration.md) for op→generation
+mapping, XML structure, and current limitations.
+
 ### Use the rclone remote, not its fuse mount
 
 If your destination is an rclone-mounted directory (e.g. `~/mnt/nas/...` from

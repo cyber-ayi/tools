@@ -48,6 +48,19 @@ class Defaults:
     checkers: int = 16
     download: bool = False
     local_cache_in_root: bool = True
+    # ASC MHL v2.0 emit: opt-in. When true, copy/check/hash ops write a
+    # generation file under <root>/ascmhl/ for the relevant side(s).
+    emit_mhl: bool = False
+    # `mhl_author` accepts git-style "Name <email@host.dom>" syntax; the
+    # email is split out into the schema's `email` attribute. When the
+    # email part doesn't validate (e.g. no '.' in domain), the full
+    # string is kept as the author name.
+    mhl_author: Optional[str] = None
+    mhl_author_phone: Optional[str] = None  # rare; <author phone="...">
+    mhl_author_role: Optional[str] = None   # e.g. "DIT", "Editor"
+    mhl_location: Optional[str] = None      # physical location, e.g. "Studio A"
+    mhl_comment: Optional[str] = None
+    mhl_sides: Optional[List[str]] = None  # None → smart default by op
 
 
 @dataclass
@@ -70,6 +83,13 @@ class Job:
     checkers: Optional[int] = None
     download: Optional[bool] = None
     local_cache_in_root: Optional[bool] = None
+    emit_mhl: Optional[bool] = None
+    mhl_author: Optional[str] = None
+    mhl_author_phone: Optional[str] = None
+    mhl_author_role: Optional[str] = None
+    mhl_location: Optional[str] = None
+    mhl_comment: Optional[str] = None
+    mhl_sides: Optional[List[str]] = None
 
     def resolved_hash(self, defaults: Defaults) -> Optional[str]:
         return self.hash or defaults.hash
@@ -95,6 +115,27 @@ class Job:
             if self.local_cache_in_root is not None
             else defaults.local_cache_in_root
         )
+
+    def resolved_emit_mhl(self, defaults: Defaults) -> bool:
+        return self.emit_mhl if self.emit_mhl is not None else defaults.emit_mhl
+
+    def resolved_mhl_author(self, defaults: Defaults) -> Optional[str]:
+        return self.mhl_author or defaults.mhl_author
+
+    def resolved_mhl_author_phone(self, defaults: Defaults) -> Optional[str]:
+        return self.mhl_author_phone or defaults.mhl_author_phone
+
+    def resolved_mhl_author_role(self, defaults: Defaults) -> Optional[str]:
+        return self.mhl_author_role or defaults.mhl_author_role
+
+    def resolved_mhl_location(self, defaults: Defaults) -> Optional[str]:
+        return self.mhl_location or defaults.mhl_location
+
+    def resolved_mhl_comment(self, defaults: Defaults) -> Optional[str]:
+        return self.mhl_comment or defaults.mhl_comment
+
+    def resolved_mhl_sides(self, defaults: Defaults) -> Optional[List[str]]:
+        return self.mhl_sides or defaults.mhl_sides
 
 
 @dataclass
@@ -125,20 +166,38 @@ class Config:
           3. bundled DEFAULT_PROFILE
         Caller is responsible for honoring `job.hash` / `defaults.hash`
         (single-algo override) ahead of this — see `negotiate_algo`.
+
+        When `emit_mhl` is in effect for this job, non-MHL-v2.0 algorithms
+        are filtered out so the negotiated algo is guaranteed emittable.
+        Empty result raises ValueError.
         """
         explicit = job.resolved_hash_priority(self.defaults)
         if explicit:
-            return [a.strip().lower() for a in explicit]
-        name = (
-            job.resolved_hash_profile(self.defaults)
-            or profiles_mod.DEFAULT_PROFILE
-        )
-        prof = profiles_mod.load(
-            name,
-            state_dir=self.state_dir_root(),
-            inline=self.inline_profiles or None,
-        )
-        return list(prof.priority)
+            priority = [a.strip().lower() for a in explicit]
+        else:
+            name = (
+                job.resolved_hash_profile(self.defaults)
+                or profiles_mod.DEFAULT_PROFILE
+            )
+            prof = profiles_mod.load(
+                name,
+                state_dir=self.state_dir_root(),
+                inline=self.inline_profiles or None,
+            )
+            priority = list(prof.priority)
+        if job.resolved_emit_mhl(self.defaults):
+            from . import mhl
+            filtered = [a for a in priority if a in mhl.MHL_ALGORITHMS]
+            if not filtered:
+                raise ValueError(
+                    f"emit_mhl=true but no MHL v2.0 algorithms remain in "
+                    f"priority. Source list: {priority}. "
+                    f"MHL set: {sorted(mhl.MHL_ALGORITHMS)}. "
+                    f"Pick an MHL-aligned profile (e.g. 'dit') or disable "
+                    f"emit_mhl."
+                )
+            priority = filtered
+        return priority
 
     def resolve_profile(self, job: Job) -> Optional[profiles_mod.Profile]:
         """Return the named profile object for `job` (None if hash_priority
@@ -176,6 +235,15 @@ def load(path: str | Path) -> Config:
         local_cache_in_root=d.get(
             "local_cache_in_root", Defaults.local_cache_in_root,
         ),
+        emit_mhl=bool(d.get("emit_mhl", Defaults.emit_mhl)),
+        mhl_author=d.get("mhl_author"),
+        mhl_author_phone=d.get("mhl_author_phone"),
+        mhl_author_role=d.get("mhl_author_role"),
+        mhl_location=d.get("mhl_location"),
+        mhl_comment=d.get("mhl_comment"),
+        mhl_sides=_as_str_list(
+            d.get("mhl_sides"), "mhl_sides", "[defaults]",
+        ),
     )
 
     de = raw.get("delete", {})
@@ -207,6 +275,15 @@ def load(path: str | Path) -> Config:
                 checkers=jr.get("checkers"),
                 download=jr.get("download"),
                 local_cache_in_root=jr.get("local_cache_in_root"),
+                emit_mhl=jr.get("emit_mhl"),
+                mhl_author=jr.get("mhl_author"),
+                mhl_author_phone=jr.get("mhl_author_phone"),
+                mhl_author_role=jr.get("mhl_author_role"),
+                mhl_location=jr.get("mhl_location"),
+                mhl_comment=jr.get("mhl_comment"),
+                mhl_sides=_as_str_list(
+                    jr.get("mhl_sides"), "mhl_sides", ctx,
+                ),
             )
         )
 

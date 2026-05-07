@@ -129,10 +129,13 @@ def cmd_hash(argv: Optional[List[str]] = None) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     with audit_mod.run(state_dir, op="hash") as ev:
         from . import manifest, state
-        from .ops import negotiate_algo, _open_state
+        from .ops import (
+            _allowed_sides, _open_state, emit_mhl_generation, negotiate_algo,
+        )
         algo = negotiate_algo(job, cfg)
         ev.set_algo(algo)
         total = 0
+        manifests: dict = {}
 
         if args.side in ("src", "both"):
             conn, _sd = _open_state(cfg, job)
@@ -144,11 +147,13 @@ def cmd_hash(argv: Optional[List[str]] = None) -> int:
                 full=args.full,
                 local_cache_in_root=job.resolved_local_cache_in_root(cfg.defaults),
                 progress=progress,
+                v=v,
             )
             if progress:
                 print(f"[src] {len(m.entries)} files, algo={algo}, stats={m.stats}")
             ev.set_counts(src=len(m.entries))
             total += len(m.entries)
+            manifests["src"] = m
             conn.close()
 
         if args.side in ("dst", "both"):
@@ -160,14 +165,26 @@ def cmd_hash(argv: Optional[List[str]] = None) -> int:
                 full=args.full,
                 local_cache_in_root=job.resolved_local_cache_in_root(cfg.defaults),
                 progress=progress,
+                v=v,
             )
             if progress:
                 print(f"[dst] {len(m.entries)} files, algo={algo}, stats={m.stats}")
             ev.set_counts(dst=len(m.entries))
             total += len(m.entries)
+            manifests["dst"] = m
             conn.close()
         ev.set_counts(affected=total)
         ev.set_result("ok")
+
+        # MHL emit (opt-in). hash op records each side as an in-place
+        # attestation of the current full manifest.
+        if job.resolved_emit_mhl(cfg.defaults):
+            for side in _allowed_sides(job, cfg, list(manifests.keys())):
+                emit_mhl_generation(
+                    cfg, job, side,
+                    entries=manifests[side].entries, algorithm=algo,
+                    process="in-place", action="original", v=v,
+                )
     return 0
 
 
@@ -667,6 +684,69 @@ def _print_jobs_table(rows: list, color: bool) -> None:
         print(f"  {note}")
 
 
+def cmd_export_mhl(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="rmig export-mhl",
+        description="Write an ASC MHL v2.0 generation file for a side (or both) "
+                    "from the current cache, without running copy/check/hash.",
+    )
+    _add_common(p)
+    p.add_argument("--side", choices=["src", "dst", "both"], default="both")
+    p.add_argument("--full", action="store_true",
+                   help="Re-hash everything before emitting (default: trust cache)")
+    args = p.parse_args(argv)
+    cfg, job = _load(args)
+    v = _make_verbose(args)
+    progress = not args.quiet
+
+    state_dir = cfg.state_dir_for(job)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with audit_mod.run(state_dir, op="export-mhl") as ev:
+        from . import manifest as mf_mod
+        from .ops import (
+            _allowed_sides, _open_state, emit_mhl_generation, negotiate_algo,
+        )
+        algo = negotiate_algo(job, cfg)
+        ev.set_algo(algo)
+        if algo not in __import__(
+            "rclone_migrate.mhl", fromlist=["MHL_ALGORITHMS"]
+        ).MHL_ALGORITHMS:
+            v.error(
+                f"negotiated algo '{algo}' is not in MHL v2.0 set. "
+                f"Set emit_mhl=true (which forces an MHL-compatible profile) "
+                f"or pick a profile like 'dit'."
+            )
+            ev.set_result("fail")
+            return 2
+
+        sides = ("src", "dst") if args.side == "both" else (args.side,)
+        emitted = 0
+        for side in _allowed_sides(job, cfg, list(sides)):
+            conn, _sd = _open_state(cfg, job)
+            m = mf_mod.refresh(
+                side, job, algo, conn, state_dir,
+                transfers=job.resolved_transfers(cfg.defaults),
+                download=job.resolved_download(cfg.defaults),
+                full=args.full,
+                local_cache_in_root=job.resolved_local_cache_in_root(cfg.defaults),
+                progress=progress, v=v,
+            )
+            conn.close()
+            p_out = emit_mhl_generation(
+                cfg, job, side,
+                entries=m.entries, algorithm=algo,
+                process="in-place", action="original", v=v,
+            )
+            if p_out is not None:
+                emitted += 1
+        ev.set_counts(affected=emitted)
+        ev.set_result("ok" if emitted else "fail")
+        if not emitted:
+            v.warn("no MHL generation written. See preceding warnings.")
+            return 1
+    return 0
+
+
 def cmd_profiles(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="rmig profiles",
@@ -881,18 +961,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not argv or argv[0] in ("-h", "--help"):
         print(
             "usage: rmig {init|hash|copy|check|delete|list-jobs|log|"
-            "file-status|profiles} [options]\n"
+            "file-status|profiles|export-mhl} [options]\n"
             "       rmig --version",
             file=sys.stderr,
         )
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     sub, rest = argv[0], argv[1:]
-    locked = {"hash", "copy", "check", "delete"}
+    locked = {"hash", "copy", "check", "delete", "export-mhl"}
     table = {
         "hash": cmd_hash, "copy": cmd_copy, "check": cmd_check,
         "delete": cmd_delete, "list-jobs": cmd_list_jobs,
         "log": cmd_log, "file-status": cmd_file_status,
         "init": cmd_init, "profiles": cmd_profiles,
+        "export-mhl": cmd_export_mhl,
     }
     if sub not in table:
         print(f"unknown subcommand: {sub}", file=sys.stderr)

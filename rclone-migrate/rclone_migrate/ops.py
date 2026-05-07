@@ -5,13 +5,14 @@ state.db meta bookkeeping that gates delete on a successful prior check.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
-from . import audit, hashing, manifest, rclone, state
+from . import audit, hashing, manifest, mhl, rclone, state
 from . import verbose as verbose_mod
 from .config import Config, Job
 
@@ -34,6 +35,81 @@ def negotiate_algo(job: Job, cfg: Config) -> str:
         return hashing.negotiate(job.src, job.dst, override=override)
     priority = cfg.resolve_priority(job)
     return hashing.negotiate(job.src, job.dst, priority=priority)
+
+
+# --- MHL emission helpers -------------------------------------------------
+
+def emit_mhl_generation(
+    cfg: Config,
+    job: Job,
+    side: str,
+    *,
+    entries: Iterable[manifest.Entry],
+    algorithm: str,
+    process: str,
+    action: str,
+    v: verbose_mod.Verbose,
+) -> Optional[Path]:
+    """Write one MHL generation if conditions allow.
+
+    Returns the manifest path on success, None if skipped (no entries,
+    remote side, non-MHL algo, etc.). Caller is responsible for the
+    feature-flag check (`job.resolved_emit_mhl`).
+    """
+    entries = list(entries)
+    if not entries:
+        v.detail(f"  [mhl] {side}: no entries; skipping")
+        return None
+    root = job.src if side == "src" else job.dst
+    if not rclone.is_local(root):
+        v.warn(
+            f"  [mhl] {side} root '{root}' is remote; skipping emit "
+            f"(MHL output supports local sides only in this version)"
+        )
+        return None
+    if algorithm not in mhl.MHL_ALGORITHMS:
+        v.warn(
+            f"  [mhl] negotiated algo '{algorithm}' is not in MHL v2.0 set; "
+            f"skipping emit. Pick an MHL-aligned profile (e.g. 'dit') "
+            f"or include sha1/md5 in your priority."
+        )
+        return None
+    root_path = Path(os.path.expanduser(root))
+    name, email = mhl.parse_author(job.resolved_mhl_author(cfg.defaults))
+    creator = mhl.CreatorInfo.default(
+        author_name=name,
+        author_email=email,
+        author_phone=job.resolved_mhl_author_phone(cfg.defaults),
+        author_role=job.resolved_mhl_author_role(cfg.defaults),
+        location=job.resolved_mhl_location(cfg.defaults),
+        comment=job.resolved_mhl_comment(cfg.defaults),
+    )
+    h_entries = [
+        mhl.HashEntry(
+            path=e.path,
+            size=e.size,
+            hashes={algorithm: e.hash},
+            actions={algorithm: action},
+        )
+        for e in entries
+    ]
+    gen = mhl.Generation(
+        sequencenr=mhl.next_sequencenr(root_path),
+        process=process,
+        creator=creator,
+        entries=h_entries,
+    )
+    p = mhl.write_generation(root_path, gen)
+    v.ok(f"  [mhl] {side} gen #{gen.sequencenr:04d} → {p.relative_to(root_path)}")
+    return p
+
+
+def _allowed_sides(job: Job, cfg: Config, default_sides: List[str]) -> List[str]:
+    """Apply user-configured `mhl_sides` filter to per-op default sides."""
+    configured = job.resolved_mhl_sides(cfg.defaults)
+    if not configured:
+        return default_sides
+    return [s for s in default_sides if s in configured]
 
 
 def _open_state(cfg: Config, job: Job) -> Tuple[sqlite3.Connection, Path]:
@@ -195,6 +271,23 @@ def do_copy(
         else:
             ev.set_result("fail")
 
+        # MHL emit on dst side after successful (full or partial) copy.
+        # Generation is the *delta*: only the files that were just copied.
+        # Existing dst files retain their attestation from earlier generations.
+        if (not dry_run and copied_dst_paths
+                and job.resolved_emit_mhl(cfg.defaults)):
+            for side in _allowed_sides(job, cfg, ["dst"]):
+                src_by_path = {e.path: e for e in src_mf.entries}
+                delta = [
+                    src_by_path[p] for p in copied_dst_paths
+                    if p in src_by_path
+                ]
+                emit_mhl_generation(
+                    cfg, job, side,
+                    entries=delta, algorithm=algo,
+                    process="transfer", action="original", v=v,
+                )
+
         state.meta_set(conn, "last_copy_ts", str(time.time()))
         # check_signature is invalidated whenever copy runs (src may have changed)
         state.meta_clear(conn, "check_signature")
@@ -268,10 +361,21 @@ def do_check(
 
         state.meta_set(conn, "check_signature", result.signature or "")
         state.meta_set(conn, "last_check_ts", str(time.time()))
-        conn.close()
         v.ok(f"\nOK: signature = {result.signature}")
         ev.set_signature(result.signature)
         ev.set_result("ok")
+
+        # MHL emit on src side: every src file just got verified against dst.
+        # process="in-place" + action="verified" — the canonical attestation.
+        if job.resolved_emit_mhl(cfg.defaults):
+            for side in _allowed_sides(job, cfg, ["src"]):
+                emit_mhl_generation(
+                    cfg, job, side,
+                    entries=src_mf.entries, algorithm=algo,
+                    process="in-place", action="verified", v=v,
+                )
+
+        conn.close()
         return 0
 
 
