@@ -39,8 +39,21 @@ top-level README is the umbrella entry point.
 
 ## Quick start
 
+### `rclone-migrate` — one-line install (signed release)
+
 ```bash
-# Clone
+curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/rclone-migrate/scripts/install.sh | bash
+```
+
+The installer downloads the latest signed wheel from the GitHub
+Release page, verifies its SHA-256, and installs `rmig` (plus its
+`rmig-*` subcommands) via [`pipx`](https://pipx.pypa.io/). For the
+audited form, optional Sigstore verification, and uninstall steps,
+see [`rclone-migrate/README.md`](rclone-migrate/README.md#install).
+
+### From source (contributors)
+
+```bash
 git clone https://github.com/Jarvie8176/tools.git
 cd tools
 
