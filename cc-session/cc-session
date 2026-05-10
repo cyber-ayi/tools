@@ -4,6 +4,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
+VERSION="0.2.0"
 
 usage() {
   cat <<EOF
@@ -13,7 +14,7 @@ NAME
 SYNOPSIS
     $PROG [-t|--teleport ID-OR-URL] [-f|--full] [-c|--compact]
               [-a|--adopt] [-d|--detach] [-l|--list] [-k|--kill NAME]
-              [-h|--help] [PROJECT_DIR] [SESSION_NAME]
+              [-v|--version] [-h|--help] [PROJECT_DIR] [SESSION_NAME]
 
 DESCRIPTION
     Starts (or re-attaches to) a tmux session running \`claude\` in
@@ -86,6 +87,7 @@ OPTIONS
                       Re-attach later with: $PROG  (without -d).
     -l, --list        List existing tmux sessions and exit.
     -k, --kill NAME   Kill the tmux session NAME and exit.
+    -v, --version     Print version ($PROG $VERSION) and exit.
     -h, --help        Show this help and exit.
 
 ENVIRONMENT
@@ -271,6 +273,8 @@ while (( $# )); do
   case "$1" in
     -h|--help)
       usage; exit 0 ;;
+    -v|--version)
+      printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
     -l|--list)
       exec tmux list-sessions ;;
     -k|--kill)

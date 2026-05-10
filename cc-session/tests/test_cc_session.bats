@@ -117,6 +117,19 @@ marker_value() {
   assert_contains "$output" "Try"
 }
 
+@test "--version prints program name + semver" {
+  run "$CC_SESSION" --version
+  assert_eq "$status" 0
+  # Output looks like: "cc-session 0.2.0"
+  [[ "$output" =~ ^cc-session\ [0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+@test "-v is an alias for --version" {
+  run "$CC_SESSION" -v
+  assert_eq "$status" 0
+  assert_contains "$output" "cc-session"
+}
+
 # --- --kill scaffolding ---------------------------------------------
 
 @test "--kill without a name exits 2" {
