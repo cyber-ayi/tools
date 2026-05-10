@@ -75,13 +75,13 @@ dropped. Long sessions (>500k tokens) and sleep / network blips are the
 usual triggers. Recover with:
 
 ```bash
-# Copy the session URL from the browser, then:
-cc-session --teleport https://claude.ai/code/session_0195UVJA1HNCupijDHF8jL7g
-cc-session --teleport session_0195UVJA1HNCupijDHF8jL7g          # bare ID
-cc-session --teleport 0195UVJA1HNCupijDHF8jL7g                  # suffix only
+# Copy the session URL from the browser; the id below is synthetic:
+cc-session --teleport https://claude.ai/code/session_01EXAMPLEabcdef1234567890
+cc-session --teleport session_01EXAMPLEabcdef1234567890         # bare ID
+cc-session --teleport 01EXAMPLEabcdef1234567890                 # suffix only
 
 # Auto-/compact 60s after teleport (pick "summary" in between):
-cc-session --teleport session_0195UVJA1HNCupijDHF8jL7g --compact
+cc-session --teleport session_01EXAMPLEabcdef1234567890 --compact
 
 # Custom delay before /compact:
 CC_SESSION_COMPACT_DELAY=120 cc-session --teleport session_xxx --compact

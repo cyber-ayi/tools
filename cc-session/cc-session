@@ -51,10 +51,11 @@ OPTIONS
                       *new* claude.ai/code URL — the original ID-OR-URL
                       stays bound to its (now-dead) bridge.
 
-                      Accepts any of:
-                        https://claude.ai/code/session_0195UVJA1HNCu...
-                        session_0195UVJA1HNCu...
-                        0195UVJA1HNCu...
+                      Accepts any of (synthetic example ID below — yours
+                      comes from the browser URL):
+                        https://claude.ai/code/session_01EXAMPLEab...
+                        session_01EXAMPLEab...
+                        01EXAMPLEab...
 
     -c, --compact     After launching (or re-attaching), schedule a
                       \`/compact\` keystroke to be sent into the claude
@@ -137,13 +138,14 @@ EXAMPLES
     $PROG --kill claude                # terminate the 'claude' session
 
     # Recover a stuck Remote Control session (browser shows
-    # "Remote Control disconnected"). Copy the URL from the browser:
-    $PROG -t https://claude.ai/code/session_0195UVJA1HNCupijDHF8jL7g
-    $PROG -t session_0195UVJA1HNCupijDHF8jL7g          # same effect
-    $PROG -t 0195UVJA1HNCupijDHF8jL7g                  # bare ID also OK
+    # "Remote Control disconnected"). Copy the URL from the browser
+    # — the synthetic id below is just for shape:
+    $PROG -t https://claude.ai/code/session_01EXAMPLEabcdef1234567890
+    $PROG -t session_01EXAMPLEabcdef1234567890         # same effect
+    $PROG -t 01EXAMPLEabcdef1234567890                 # bare ID also OK
 
     # Teleport + auto /compact 60s later (summary auto-picked first):
-    $PROG -t session_0195UVJA1HNCupijDHF8jL7g -c
+    $PROG -t session_01EXAMPLEabcdef1234567890 -c
 
     # Custom /compact delay:
     CC_SESSION_COMPACT_DELAY=120 $PROG -t session_xxx -c
