@@ -228,14 +228,28 @@ RC_URL_REGEX='https://claude\.ai/code/session_[0-9A-Za-z]+'
 
 # Scan a tmux session's pane for the active-RC status line. Empty
 # stdout means RC is not currently advertised in the visible scrollback.
-# `-J` joins wrapped lines so URLs longer than the pane width still
-# match as a single token.
+#
+# claude's real TUI wraps the line "/remote-control is active · Code
+# in CLI or at" onto two visible lines in narrow panes — not as a
+# tmux soft-wrap (which `-J` would join), but as two distinct logical
+# lines, with the URL on the second. We anchor on "is active" and use
+# grep -A1 to include the next line; the URL match wins on whichever
+# line it lands on. `tail -1` picks the most recent URL when several
+# toggles sit in the scrollback.
 get_active_rc_url() {
   local sess="$1"
+  # Two patterns the TUI surfaces an active RC URL under:
+  #   1. "/remote-control is active · Code in CLI or at <URL>"
+  #      — printed once when RC is enabled.
+  #   2. "This session is available via Remote Control at\n<URL>"
+  #      — the management menu shown if /remote-control is invoked
+  #      while RC is already active. Detecting this pattern lets the
+  #      pre-check find a URL without opening the menu (which would
+  #      then need an Esc to dismiss).
   tmux capture-pane -t "$sess" -p -S -200 -J 2>/dev/null \
-    | grep -oE "is active.*$RC_URL_REGEX" \
-    | tail -1 \
+    | grep -A1 -E '(is active|available via Remote Control)' \
     | grep -oE "$RC_URL_REGEX" \
+    | tail -1 \
     || true
 }
 
@@ -256,6 +270,16 @@ enable_remote_control() {
     sleep 0.5
     url="$(get_active_rc_url "$sess")"
     if [[ -n "$url" ]]; then
+      # Edge case: RC was already on (status line had scrolled past
+      # the pre-check window) so /remote-control opened the management
+      # menu. The URL just got found via the menu's "available via
+      # Remote Control at" text — but the menu is still on screen
+      # waiting for input. Dismiss with Esc so the pane returns to
+      # idle. No-op when there's no menu (fresh-enable path).
+      if tmux capture-pane -t "$sess" -p 2>/dev/null \
+           | grep -q 'Disconnect this session'; then
+        tmux send-keys -t "$sess" Escape 2>/dev/null || true
+      fi
       printf '%s\n' "$url"
       return 0
     fi
