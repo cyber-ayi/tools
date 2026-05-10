@@ -122,6 +122,23 @@ caffeinate -i -t 7200 cc-session -d   # detach, hold awake for 2h
 Lid-closed (clamshell) sleep is not covered by `caffeinate` and needs
 external power + display + input, or a system-settings change.
 
+## Tests
+
+Black-box tests live in [`tests/`](tests/) and run under
+[bats](https://github.com/bats-core/bats-core). They stub the `claude`
+binary with `tests/fixtures/fake-claude` so nothing touches the real CLI
+or the cloud.
+
+```bash
+brew install bats-core         # macOS
+sudo apt install bats          # Ubuntu
+
+bats cc-session/tests/         # 25 tests, ~5s
+```
+
+CI (`.github/workflows/ci.yml`) runs the same suite plus a
+`zsh -n cc-session` syntax check on every PR that touches `cc-session/`.
+
 ## License
 
 Apache 2.0 — see [LICENSE](../LICENSE).
