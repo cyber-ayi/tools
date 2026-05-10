@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stub claude binary for cc-session tests. Prints the args it was
+# invoked with so tests can assert on argument forwarding, then sleeps
+# so the tmux pane stays alive long enough for further assertions.
+echo "fake claude args: $*"
+exec sleep 3600

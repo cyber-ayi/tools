@@ -1,0 +1,346 @@
+#!/bin/zsh
+# Attach to a persistent Claude Code tmux session, or create one.
+
+set -euo pipefail
+
+PROG="${0##*/}"
+
+usage() {
+  cat <<EOF
+NAME
+    $PROG - attach to a persistent Claude Code tmux session
+
+SYNOPSIS
+    $PROG [-t|--teleport ID-OR-URL] [-c|--compact] [-d|--detach]
+              [-l|--list] [-k|--kill NAME] [-h|--help]
+              [PROJECT_DIR] [SESSION_NAME]
+
+DESCRIPTION
+    Starts (or re-attaches to) a tmux session running \`claude
+    --remote-control\` in PROJECT_DIR. Re-running with the same
+    SESSION_NAME re-attaches to the live session, so Claude Code keeps
+    running across SSH disconnects and across devices (e.g. Mac desktop
+    -> phone over Tailscale).
+
+    Remote Control is enabled by default so the session is reachable
+    from claude.ai/code. If the browser-side bridge becomes
+    unresponsive (long sessions, sleep, network blips), recover with
+    --teleport — see below.
+
+ARGUMENTS
+    PROJECT_DIR     Directory to cd into before launching claude.
+                    Default: \$HOME/cc
+
+    SESSION_NAME    tmux session name. Use distinct names to keep multiple
+                    Claude Code sessions in parallel.
+                    Default: claude
+
+OPTIONS
+    -t, --teleport ID-OR-URL
+                      Take over a Claude Code conversation that became
+                      unresponsive in the browser. Kills any existing
+                      tmux session with the same name (only if it was
+                      created by $PROG — see "Managed-session marker"
+                      below) and starts a fresh one running \`claude
+                      --remote-control --teleport <id>\`, which produces
+                      a new Remote Control link the browser can
+                      reconnect to.
+
+                      Accepts any of:
+                        https://claude.ai/code/session_0195UVJA1HNCu...
+                        session_0195UVJA1HNCu...
+                        0195UVJA1HNCu...
+
+    -c, --compact     After launching (or re-attaching), schedule a
+                      \`/compact\` keystroke to be sent into the claude
+                      pane after CC_SESSION_COMPACT_DELAY seconds (60s
+                      default).
+
+    -f, --full        With --teleport, resume from the FULL transcript
+                      instead of the default summary. This re-pays the
+                      entire conversation's token cost on the cloud
+                      side and can consume a large slice of usage
+                      limits on long sessions. Requires interactive
+                      confirmation ("yes") at the prompt; set
+                      CC_SESSION_SKIP_FULL_CONFIRM=1 to bypass when
+                      scripting. Has no effect without --teleport.
+
+    -d, --detach      Start the session in the background and don't attach.
+                      If the session already exists, this is a no-op
+                      (unless combined with --teleport, which always
+                      recycles the session).
+                      Re-attach later with: $PROG  (without -d).
+    -l, --list        List existing tmux sessions and exit.
+    -k, --kill NAME   Kill the tmux session NAME and exit.
+    -h, --help        Show this help and exit.
+
+ENVIRONMENT
+    CLAUDE_BIN                      Path to the claude binary.
+                                    Auto-detected from
+                                    \$HOME/.local/bin/claude, then \$PATH.
+    CC_SESSION_COMPACT_DELAY        Seconds to wait before sending
+                                    /compact with --compact. Default: 60.
+    CC_SESSION_SKIP_FULL_CONFIRM    Set to 1 to skip the "type yes"
+                                    confirmation that --full requires.
+
+POST-TELEPORT RESUME
+
+    With --teleport, claude shows a resume prompt (full vs. summary).
+    cc-session schedules a background \`tmux send-keys\` that picks
+    "Resume from summary" (option 1) by default once the prompt
+    appears (poll up to 30s for the marker text). Pass --full to pick
+    "Resume full session as-is" (option 2) instead.
+
+    If the prompt never shows (short session, "don't ask me again"
+    previously set), the background poll times out silently — no key
+    is pressed.
+
+EXAMPLES
+    $PROG                              # ~/cc, session 'claude'
+    $PROG ~/work/api                   # custom project, session 'claude'
+    $PROG ~/work/api api               # custom project, session 'api'
+    $PROG -d ~/work/api api            # start 'api' detached
+    $PROG api                          # later: attach to 'api'
+    $PROG --list                       # show running sessions
+    $PROG --kill claude                # terminate the 'claude' session
+
+    # Recover a stuck Remote Control session (browser shows
+    # "Remote Control disconnected"). Copy the URL from the browser:
+    $PROG -t https://claude.ai/code/session_0195UVJA1HNCupijDHF8jL7g
+    $PROG -t session_0195UVJA1HNCupijDHF8jL7g          # same effect
+    $PROG -t 0195UVJA1HNCupijDHF8jL7g                  # bare ID also OK
+
+    # Teleport + auto /compact 60s later (summary auto-picked first):
+    $PROG -t session_0195UVJA1HNCupijDHF8jL7g -c
+
+    # Custom /compact delay:
+    CC_SESSION_COMPACT_DELAY=120 $PROG -t session_xxx -c
+
+    # Resume the FULL transcript (asks for 'yes' confirmation):
+    $PROG -t session_xxx --full
+
+    # Same, scripted (no prompt):
+    CC_SESSION_SKIP_FULL_CONFIRM=1 $PROG -t session_xxx --full -d
+
+TIPS
+    Inside tmux:
+      prefix d        detach (leave claude running in background)
+      prefix [        scroll mode (q to exit)
+      prefix c        new window — gives you a shell; claude keeps running
+      prefix |  / -   split pane (custom binding)
+      prefix n / p    next / previous window
+
+    The session's first pane runs claude directly (no shell). To get a
+    shell without killing claude, open a new window/pane as above, or
+    from outside: tmux new-window -t \$SESSION_NAME
+
+    Re-attach later from any device:
+      ssh mac
+      $PROG
+
+    Managed-session marker
+      Sessions created by $PROG carry a tmux user option
+      \`@cc-session-managed=1\` (set with \`tmux set-option\` right
+      after creation). --teleport's session-recycling step refuses
+      to kill a tmux session that doesn't have this marker, so it
+      won't clobber a same-named session you set up by hand.
+
+      $PROG-managed sessions assume the first window's first pane is
+      claude. Splitting panes inside a managed session is fine for
+      ephemeral shells, but be aware --teleport will tear them down.
+
+    Two ways to recover a Claude conversation that's no longer reachable
+    from the browser:
+
+    1. --teleport (above) — preferred when the browser shows "Remote
+       Control disconnected" with a session_xxx URL. Cloud-side
+       takeover; produces a fresh RC link.
+
+    2. \`claude --resume\` — local-side resume by the on-disk session UUID
+       (different ID space from session_xxx). Useful when you don't
+       care about reconnecting the browser:
+         claude --resume <uuid>     # resume by ID
+         claude --resume            # interactive picker
+         claude -c                  # continue most recent in this dir
+
+    When prompted, prefer "resume from summary" over the full transcript
+    so you don't re-pay the entire token count.
+EOF
+}
+
+# --- helpers -----------------------------------------------------------------
+# Normalise a Claude Code session reference into the canonical
+# `session_xxx` form. Accepts a full claude.ai/code URL, the bare
+# `session_xxx` ID, or just the suffix after `session_`.
+parse_session_id() {
+  local raw="$1"
+  raw="${raw##*claude.ai/code/}"   # strip URL prefix if present
+  raw="${raw%%[\?\#]*}"            # strip query / fragment
+  raw="${raw%/}"                   # strip trailing slash
+  [[ "$raw" == session_* ]] || raw="session_$raw"
+  if [[ ! "$raw" =~ ^session_[0-9A-Za-z]+$ ]]; then
+    echo "$PROG: invalid session id: $1" >&2
+    return 2
+  fi
+  printf '%s\n' "$raw"
+}
+
+# --- arg parsing -------------------------------------------------------------
+DETACH=0
+TELEPORT_ID=""
+RUN_COMPACT=0
+RESUME_FULL=0
+while (( $# )); do
+  case "$1" in
+    -h|--help)
+      usage; exit 0 ;;
+    -l|--list)
+      exec tmux list-sessions ;;
+    -k|--kill)
+      [[ -z "${2:-}" ]] && { echo "$PROG: --kill requires a session name" >&2; exit 2; }
+      exec tmux kill-session -t "$2" ;;
+    -d|--detach)
+      DETACH=1; shift ;;
+    -t|--teleport)
+      [[ -z "${2:-}" ]] && { echo "$PROG: --teleport requires a session id or URL" >&2; exit 2; }
+      TELEPORT_ID="$(parse_session_id "$2")" || exit $?
+      shift 2 ;;
+    -c|--compact)
+      RUN_COMPACT=1; shift ;;
+    -f|--full)
+      RESUME_FULL=1; shift ;;
+    --)
+      shift; break ;;
+    -*)
+      echo "$PROG: unknown option: $1" >&2
+      echo "Try '$PROG --help'." >&2
+      exit 2 ;;
+    *)
+      break ;;
+  esac
+done
+
+# --full only makes sense with --teleport (it picks the post-teleport
+# resume option). Refuse silent no-ops.
+if (( RESUME_FULL )) && [[ -z "$TELEPORT_ID" ]]; then
+  echo "$PROG: --full requires --teleport" >&2
+  exit 2
+fi
+
+# Confirm --full because it can re-pay the entire conversation's tokens.
+# Skip when CC_SESSION_SKIP_FULL_CONFIRM=1 (for unattended use).
+if (( RESUME_FULL )) && [[ "${CC_SESSION_SKIP_FULL_CONFIRM:-}" != "1" ]]; then
+  cat >&2 <<EOF
+$PROG: --full will resume the ENTIRE conversation transcript on the
+       cloud side, including all tool outputs. For long sessions this
+       can consume a substantial portion of your usage limits.
+
+       Summary resume (the default without --full) is recommended. To
+       skip this prompt in scripts, set CC_SESSION_SKIP_FULL_CONFIRM=1.
+
+EOF
+  printf '%s' 'Type "yes" to continue with --full: ' >&2
+  read -r confirm
+  if [[ "$confirm" != "yes" ]]; then
+    echo "$PROG: aborted." >&2
+    exit 1
+  fi
+fi
+
+PROJECT_DIR="${1:-$HOME/cc}"
+SESSION_NAME="${2:-claude}"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "$PROG: directory not found: $PROJECT_DIR" >&2
+  exit 1
+fi
+
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+  CLAUDE_BIN="$(command -v claude || true)"
+fi
+if [[ -z "${CLAUDE_BIN:-}" ]]; then
+  echo "$PROG: claude binary not found (set CLAUDE_BIN or install claude)" >&2
+  exit 1
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "$PROG: tmux not installed (try: brew install tmux)" >&2
+  exit 1
+fi
+
+# Build claude argv. RC is on by default so the session is reachable
+# from claude.ai/code; --teleport takes over a stuck cloud-side session.
+CLAUDE_ARGS=(--remote-control)
+if [[ -n "$TELEPORT_ID" ]]; then
+  CLAUDE_ARGS+=(--teleport "$TELEPORT_ID")
+  # --teleport recycles the tmux session — but only if cc-session
+  # created it. We mark managed sessions with the @cc-session-managed
+  # tmux user option (set after new-session below); refuse to kill
+  # anything without that marker so we don't clobber a same-named
+  # session the user set up by hand.
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
+    if [[ "$managed" != "1" ]]; then
+      echo "$PROG: refusing to kill tmux session '$SESSION_NAME' (not created by $PROG)" >&2
+      echo "       Sessions cc-session creates carry @cc-session-managed=1;" >&2
+      echo "       this one has no marker. Either:" >&2
+      echo "         tmux kill-session -t $SESSION_NAME    # then retry" >&2
+      echo "         $PROG -t ... <other-name>             # use a different tmux name" >&2
+      exit 1
+    fi
+    tmux kill-session -t "$SESSION_NAME"
+  fi
+fi
+
+# When --teleport, schedule the post-teleport resume choice. Poll the
+# pane every 0.5s for up to ~15s, looking for "Resume from summary",
+# then press 1 (summary, default) or 2 (full, with --full). If the
+# prompt never shows (short session, "don't ask me again" previously
+# selected), the loop times out silently. Runs in a backgrounded
+# subshell that survives `exec tmux attach`.
+if [[ -n "$TELEPORT_ID" ]]; then
+  if (( RESUME_FULL )); then
+    RESUME_KEY=2
+  else
+    RESUME_KEY=1
+  fi
+  ( for _i in {1..30}; do
+      if tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null \
+           | grep -q 'Resume from summary'; then
+        tmux send-keys -t "$SESSION_NAME" "$RESUME_KEY" Enter
+        exit 0
+      fi
+      sleep 0.5
+    done ) >/dev/null 2>&1 &
+fi
+
+# Schedule /compact after a delay so it lands once the resume / teleport
+# prompt is past. Runs in a detached subshell that survives `exec tmux`.
+if (( RUN_COMPACT )); then
+  ( sleep "${CC_SESSION_COMPACT_DELAY:-60}" \
+    && tmux send-keys -t "$SESSION_NAME" "/compact" Enter ) \
+    >/dev/null 2>&1 &
+fi
+
+# Create the session if missing and stamp it as managed, then attach
+# (or stay detached). Splitting create + attach lets us set the marker
+# on creation only — re-attaching to an existing session leaves the
+# (possibly absent) marker alone.
+created=""
+if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}"
+  tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
+  created=1
+fi
+
+if (( DETACH )); then
+  if [[ -n "$created" ]]; then
+    echo "$PROG: started '$SESSION_NAME' in $PROJECT_DIR (detached)"
+  else
+    echo "$PROG: session '$SESSION_NAME' already running"
+  fi
+  exit 0
+fi
+
+exec tmux attach -t "$SESSION_NAME"
