@@ -13,8 +13,9 @@ NAME
 
 SYNOPSIS
     $PROG [-t|--teleport ID-OR-URL] [-f|--full] [-c|--compact]
-              [-a|--adopt] [-d|--detach] [-l|--list] [-k|--kill NAME]
+              [-d|--detach] [-l|--list] [-k|--kill NAME]
               [-v|--version] [-h|--help] [PROJECT_DIR] [SESSION_NAME]
+    $PROG -a|--adopt [SESSION_NAME]
 
 DESCRIPTION
     Starts (or re-attaches to) a tmux session running \`claude\` in
@@ -80,6 +81,15 @@ OPTIONS
                       Refuses to act on tmux sessions without the
                       @cc-session-managed marker. Mutually exclusive
                       with --teleport / --detach / --compact / --full.
+
+                      Positional convention: --adopt takes at most
+                      ONE positional, the tmux SESSION_NAME (default
+                      'claude') — PROJECT_DIR is irrelevant since
+                      nothing is launched. If the positional looks
+                      like a cloud session ID (20+ char alphanumeric
+                      or session_-prefixed), --adopt rejects it and
+                      hints at --teleport, which is what you want
+                      for reclaiming a cloud-side conversation.
 
     -d, --detach      Start the session in the background and don't attach.
                       If the session already exists, this is a no-op
@@ -381,7 +391,33 @@ fi
 # Short-circuits before launch validation: doesn't need PROJECT_DIR or
 # CLAUDE_BIN, just an existing cc-session-managed tmux session whose
 # claude TUI is at idle.
+#
+# Positional handling differs from the launch path: --adopt takes at
+# most one positional, the tmux SESSION_NAME (default 'claude').
+# PROJECT_DIR is meaningless here. The bug this guards: with the
+# launch-style "[PROJECT_DIR] [SESSION_NAME]" convention, a user who
+# typed \`cc-session --adopt <some-id>\` would silently get the first
+# arg parsed as PROJECT_DIR and SESSION_NAME defaulted to 'claude' —
+# adopting whatever tmux session happened to be named 'claude'.
 if (( ADOPT )); then
+  if [[ -n "${2:-}" ]]; then
+    echo "$PROG: --adopt takes at most one positional (SESSION_NAME); got 2" >&2
+    echo "       Usage: $PROG --adopt [SESSION_NAME]" >&2
+    exit 2
+  fi
+  SESSION_NAME="${1:-claude}"
+  # Heuristic: a 20+ char pure-alphanumeric (ULID-shape) or
+  # session_-prefixed value is almost certainly a cloud session ID
+  # the user copied from a browser URL — not a tmux session name.
+  # Refuse with a hint at --teleport rather than silently fail to
+  # find a matching tmux session.
+  if [[ "$SESSION_NAME" =~ ^[0-9A-Za-z]{20,}$ ]] || [[ "$SESSION_NAME" == session_* ]]; then
+    echo "$PROG: '$SESSION_NAME' looks like a cloud session ID, not a tmux session name." >&2
+    echo "       --adopt operates on a locally-running tmux session (default name: 'claude')." >&2
+    echo "       To reclaim a cloud-side conversation, use --teleport instead:" >&2
+    echo "         $PROG --teleport $SESSION_NAME" >&2
+    exit 2
+  fi
   if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     echo "$PROG: tmux session '$SESSION_NAME' does not exist (nothing to adopt)" >&2
     exit 1

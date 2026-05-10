@@ -335,14 +335,14 @@ marker_value() {
 }
 
 @test "--adopt fails on nonexistent tmux session" {
-  run "$CC_SESSION" --adopt "$TEST_DIR" "definitely-not-here-$$-$BATS_TEST_NUMBER"
+  run "$CC_SESSION" --adopt "definitely-not-here-$$-$BATS_TEST_NUMBER"
   assert_eq "$status" 1
   assert_contains "$output" "does not exist"
 }
 
 @test "--adopt refuses an unmanaged tmux session" {
   tmux new-session -d -s "$SESSION_NAME" -c "$TEST_DIR" "sleep 3600"
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 1
   assert_contains "$output" "refusing to adopt unmanaged"
   assert_contains "$output" "@cc-session-managed marker"
@@ -355,7 +355,7 @@ marker_value() {
   tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
   sleep 0.5  # let fake-claude reach its read loop
 
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 0
   assert_contains "$output" "Remote Control on '$SESSION_NAME'"
   assert_contains "$output" "https://claude.ai/code/session_FAKE"
@@ -370,15 +370,48 @@ marker_value() {
   tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
   sleep 0.5
 
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 0
   url1="$(printf '%s\n' "$output" | grep -oE 'https://claude\.ai/code/session_FAKE[0-9]+')"
 
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 0
   url2="$(printf '%s\n' "$output" | grep -oE 'https://claude\.ai/code/session_FAKE[0-9]+')"
 
   assert_eq "$url1" "$url2"
+}
+
+@test "--adopt rejects 2 positionals (single SESSION_NAME convention)" {
+  run "$CC_SESSION" --adopt some-dir some-session
+  assert_eq "$status" 2
+  assert_contains "$output" "takes at most one positional"
+}
+
+@test "--adopt rejects ULID-shaped arg with --teleport hint" {
+  # 24-char alphanumeric — typical cloud session ID shape (no hyphens
+  # or underscores — those would suggest it's a real tmux name).
+  run "$CC_SESSION" --adopt 01ABCDEFGHIJklmnopqrstuv
+  assert_eq "$status" 2
+  assert_contains "$output" "looks like a cloud session ID"
+  assert_contains "$output" "--teleport"
+}
+
+@test "--adopt rejects session_-prefixed arg with --teleport hint" {
+  run "$CC_SESSION" --adopt session_01TESTabc
+  assert_eq "$status" 2
+  assert_contains "$output" "cloud session ID"
+  assert_contains "$output" "--teleport session_01TESTabc"
+}
+
+@test "--adopt accepts a regular tmux name with hyphens (not flagged as cloud ID)" {
+  # Even though >20 chars, hyphens disqualify the ULID heuristic.
+  long_name="my-very-long-tmux-session-name"
+  run "$CC_SESSION" --adopt "$long_name"
+  # Will fail with "does not exist" (no such tmux session) — which is
+  # the right error class. The point: not flagged as cloud ID.
+  assert_eq "$status" 1
+  assert_contains "$output" "does not exist"
+  refute_contains "$output" "cloud session ID"
 }
 
 # --- Error paths -----------------------------------------------------
