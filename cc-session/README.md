@@ -9,6 +9,11 @@ session instead of starting a new one, so your conversation survives the
 network blips that would otherwise drop the browser-side "Remote Control"
 bridge.
 
+When the browser bridge does drop ("Remote Control disconnected"), copy the
+`session_xxx` URL from the browser and run
+`cc-session --teleport <id-or-url>` — see [Recovering a stuck Remote Control
+session](#recovering-a-stuck-remote-control-session) below.
+
 ## Install
 
 ```bash
@@ -32,6 +37,11 @@ cc-session --kill claude            # terminate the 'claude' session
 cc-session --help                   # full reference
 ```
 
+`claude` is launched with `--remote-control` by default so the session is
+reachable from `claude.ai/code`. Each session cc-session creates is stamped
+with the tmux user option `@cc-session-managed=1` so destructive flags
+(`--teleport`) refuse to touch a same-named session you set up by hand.
+
 ## Tips
 
 The first pane runs `claude` directly with no shell. To get a shell without
@@ -47,17 +57,39 @@ killing claude:
 
 Or from outside: `tmux new-window -t <SESSION_NAME>`.
 
-### Recovering a Claude session
+### Recovering a stuck Remote Control session
 
-If the browser shows **"Remote Control disconnected"**, only the WebSocket
-bridge to `claude.ai/code` dropped — the local transcript is still saved
-on disk. Long sessions (>500k tokens) and sleep / network blips are the
-usual triggers.
+When the browser shows **"Remote Control disconnected"**, the local
+transcript is still safe — only the WebSocket bridge to `claude.ai/code`
+dropped. Long sessions (>500k tokens) and sleep / network blips are the
+usual triggers. Recover with:
 
 ```bash
-claude --resume <session-id>   # resume a specific session
-claude --resume                # interactive picker
-claude -c                      # continue most recent in this dir
+# Copy the session URL from the browser, then:
+cc-session --teleport https://claude.ai/code/session_0195UVJA1HNCupijDHF8jL7g
+cc-session --teleport session_0195UVJA1HNCupijDHF8jL7g          # bare ID
+cc-session --teleport 0195UVJA1HNCupijDHF8jL7g                  # suffix only
+
+# Auto-/compact 60s after teleport (pick "summary" in between):
+cc-session --teleport session_0195UVJA1HNCupijDHF8jL7g --compact
+
+# Custom delay before /compact:
+CC_SESSION_COMPACT_DELAY=120 cc-session --teleport session_xxx --compact
+```
+
+`--teleport` kills the existing tmux session (only if it carries the
+`@cc-session-managed=1` marker — see above) and starts a new one running
+`claude --remote-control --teleport <id>`. claude pulls the session from
+the cloud, prompts to resume from summary or full transcript, and emits a
+fresh Remote Control link for the browser to reconnect.
+
+You can also resume locally without teleport, by the on-disk session UUID
+(different ID space from `session_xxx`):
+
+```bash
+claude --resume <uuid>     # resume by ID
+claude --resume            # interactive picker
+claude -c                  # continue most recent in this dir
 ```
 
 When the resume prompt offers it, prefer **"resume from summary"** over the
