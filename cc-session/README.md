@@ -83,6 +83,20 @@ CC_SESSION_COMPACT_DELAY=120 cc-session --teleport session_xxx --compact
 the cloud, prompts to resume from summary or full transcript, and emits a
 fresh Remote Control link for the browser to reconnect.
 
+cc-session **auto-picks "Resume from summary"** (option 1) at the
+post-teleport prompt by polling the pane for the prompt text and sending
+the keystroke once it shows. To resume the full transcript instead, pass
+`--full`:
+
+```bash
+cc-session --teleport session_xxx --full
+# Prompts: Type "yes" to continue with --full:
+#   - because full resume can re-pay the entire conversation's tokens
+
+# In scripts, skip the confirmation:
+CC_SESSION_SKIP_FULL_CONFIRM=1 cc-session --teleport session_xxx --full -d
+```
+
 You can also resume locally without teleport, by the on-disk session UUID
 (different ID space from `session_xxx`):
 

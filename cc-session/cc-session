@@ -54,9 +54,16 @@ OPTIONS
     -c, --compact     After launching (or re-attaching), schedule a
                       \`/compact\` keystroke to be sent into the claude
                       pane after CC_SESSION_COMPACT_DELAY seconds (60s
-                      default). Useful with --teleport to summarize the
-                      resumed conversation; the delay gives you time to
-                      pick "resume from summary" first.
+                      default).
+
+    -f, --full        With --teleport, resume from the FULL transcript
+                      instead of the default summary. This re-pays the
+                      entire conversation's token cost on the cloud
+                      side and can consume a large slice of usage
+                      limits on long sessions. Requires interactive
+                      confirmation ("yes") at the prompt; set
+                      CC_SESSION_SKIP_FULL_CONFIRM=1 to bypass when
+                      scripting. Has no effect without --teleport.
 
     -d, --detach      Start the session in the background and don't attach.
                       If the session already exists, this is a no-op
@@ -68,10 +75,25 @@ OPTIONS
     -h, --help        Show this help and exit.
 
 ENVIRONMENT
-    CLAUDE_BIN                  Path to the claude binary. Auto-detected
-                                from \$HOME/.local/bin/claude, then \$PATH.
-    CC_SESSION_COMPACT_DELAY    Seconds to wait before sending /compact
-                                with --compact. Default: 60.
+    CLAUDE_BIN                      Path to the claude binary.
+                                    Auto-detected from
+                                    \$HOME/.local/bin/claude, then \$PATH.
+    CC_SESSION_COMPACT_DELAY        Seconds to wait before sending
+                                    /compact with --compact. Default: 60.
+    CC_SESSION_SKIP_FULL_CONFIRM    Set to 1 to skip the "type yes"
+                                    confirmation that --full requires.
+
+POST-TELEPORT RESUME
+
+    With --teleport, claude shows a resume prompt (full vs. summary).
+    cc-session schedules a background \`tmux send-keys\` that picks
+    "Resume from summary" (option 1) by default once the prompt
+    appears (poll up to 30s for the marker text). Pass --full to pick
+    "Resume full session as-is" (option 2) instead.
+
+    If the prompt never shows (short session, "don't ask me again"
+    previously set), the background poll times out silently — no key
+    is pressed.
 
 EXAMPLES
     $PROG                              # ~/cc, session 'claude'
@@ -88,11 +110,17 @@ EXAMPLES
     $PROG -t session_0195UVJA1HNCupijDHF8jL7g          # same effect
     $PROG -t 0195UVJA1HNCupijDHF8jL7g                  # bare ID also OK
 
-    # Teleport + auto /compact 60s later (pick "summary" in between):
+    # Teleport + auto /compact 60s later (summary auto-picked first):
     $PROG -t session_0195UVJA1HNCupijDHF8jL7g -c
 
     # Custom /compact delay:
     CC_SESSION_COMPACT_DELAY=120 $PROG -t session_xxx -c
+
+    # Resume the FULL transcript (asks for 'yes' confirmation):
+    $PROG -t session_xxx --full
+
+    # Same, scripted (no prompt):
+    CC_SESSION_SKIP_FULL_CONFIRM=1 $PROG -t session_xxx --full -d
 
 TIPS
     Inside tmux:
@@ -161,6 +189,7 @@ parse_session_id() {
 DETACH=0
 TELEPORT_ID=""
 RUN_COMPACT=0
+RESUME_FULL=0
 while (( $# )); do
   case "$1" in
     -h|--help)
@@ -178,6 +207,8 @@ while (( $# )); do
       shift 2 ;;
     -c|--compact)
       RUN_COMPACT=1; shift ;;
+    -f|--full)
+      RESUME_FULL=1; shift ;;
     --)
       shift; break ;;
     -*)
@@ -188,6 +219,33 @@ while (( $# )); do
       break ;;
   esac
 done
+
+# --full only makes sense with --teleport (it picks the post-teleport
+# resume option). Refuse silent no-ops.
+if (( RESUME_FULL )) && [[ -z "$TELEPORT_ID" ]]; then
+  echo "$PROG: --full requires --teleport" >&2
+  exit 2
+fi
+
+# Confirm --full because it can re-pay the entire conversation's tokens.
+# Skip when CC_SESSION_SKIP_FULL_CONFIRM=1 (for unattended use).
+if (( RESUME_FULL )) && [[ "${CC_SESSION_SKIP_FULL_CONFIRM:-}" != "1" ]]; then
+  cat >&2 <<EOF
+$PROG: --full will resume the ENTIRE conversation transcript on the
+       cloud side, including all tool outputs. For long sessions this
+       can consume a substantial portion of your usage limits.
+
+       Summary resume (the default without --full) is recommended. To
+       skip this prompt in scripts, set CC_SESSION_SKIP_FULL_CONFIRM=1.
+
+EOF
+  printf '%s' 'Type "yes" to continue with --full: ' >&2
+  read -r confirm
+  if [[ "$confirm" != "yes" ]]; then
+    echo "$PROG: aborted." >&2
+    exit 1
+  fi
+fi
 
 PROJECT_DIR="${1:-$HOME/cc}"
 SESSION_NAME="${2:-claude}"
@@ -233,6 +291,28 @@ if [[ -n "$TELEPORT_ID" ]]; then
     fi
     tmux kill-session -t "$SESSION_NAME"
   fi
+fi
+
+# When --teleport, schedule the post-teleport resume choice. Poll the
+# pane every 0.5s for up to ~15s, looking for "Resume from summary",
+# then press 1 (summary, default) or 2 (full, with --full). If the
+# prompt never shows (short session, "don't ask me again" previously
+# selected), the loop times out silently. Runs in a backgrounded
+# subshell that survives `exec tmux attach`.
+if [[ -n "$TELEPORT_ID" ]]; then
+  if (( RESUME_FULL )); then
+    RESUME_KEY=2
+  else
+    RESUME_KEY=1
+  fi
+  ( for _i in {1..30}; do
+      if tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null \
+           | grep -q 'Resume from summary'; then
+        tmux send-keys -t "$SESSION_NAME" "$RESUME_KEY" Enter
+        exit 0
+      fi
+      sleep 0.5
+    done ) >/dev/null 2>&1 &
 fi
 
 # Schedule /compact after a delay so it lands once the resume / teleport
