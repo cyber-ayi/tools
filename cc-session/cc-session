@@ -417,14 +417,6 @@ if [[ -n "$TELEPORT_ID" ]]; then
   fi
 fi
 
-# Schedule the post-launch keystroke flow in a backgrounded subshell
-# that survives `exec tmux attach`:
-#   1. (--teleport only) Poll for "Resume from summary" prompt up to
-#      ~15s, then send "1" (summary, default) or "2" (--full).
-#   2. Poll for the active-RC marker; if absent, send "/remote-control"
-#      and wait up to ~10s for it to surface. Capture the URL into
-#      $TMPDIR/cc-session/<SESSION>.url and flash it via tmux
-#      display-message so the URL is visible without grepping.
 if [[ -n "$TELEPORT_ID" ]]; then
   if (( RESUME_FULL )); then
     RESUME_KEY=2
@@ -432,6 +424,29 @@ if [[ -n "$TELEPORT_ID" ]]; then
     RESUME_KEY=1
   fi
 fi
+
+# Create the session if missing and stamp it as managed, then attach
+# (or stay detached). Splitting create + attach lets us set the marker
+# on creation only — re-attaching to an existing session leaves the
+# (possibly absent) marker alone.
+created=""
+if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}"
+  tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
+  created=1
+fi
+
+# Schedule the post-launch keystroke flow in a backgrounded subshell
+# that survives `exec tmux attach`. Started AFTER `tmux new-session`
+# so we never race the session into existence — early `tmux send-keys`
+# against a not-yet-created session would silently no-op.
+#
+#   1. (--teleport only) Poll for "Resume from summary" prompt up to
+#      ~15s, then send "1" (summary, default) or "2" (--full).
+#   2. Poll for the active-RC marker; if absent, send "/remote-control"
+#      and wait up to ~10s for it to surface. Capture the URL into
+#      $TMPDIR/cc-session/<SESSION>.url and flash it via tmux
+#      display-message so the URL is visible without grepping.
 (
   if [[ -n "$TELEPORT_ID" ]]; then
     for _i in {1..30}; do
@@ -459,17 +474,6 @@ if (( RUN_COMPACT )); then
   ( sleep "${CC_SESSION_COMPACT_DELAY:-60}" \
     && tmux send-keys -t "$SESSION_NAME" "/compact" Enter ) \
     >/dev/null 2>&1 &
-fi
-
-# Create the session if missing and stamp it as managed, then attach
-# (or stay detached). Splitting create + attach lets us set the marker
-# on creation only — re-attaching to an existing session leaves the
-# (possibly absent) marker alone.
-created=""
-if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-  tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}"
-  tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
-  created=1
 fi
 
 if (( DETACH )); then
