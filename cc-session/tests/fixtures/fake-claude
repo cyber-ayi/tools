@@ -1,6 +1,44 @@
 #!/bin/sh
-# Stub claude binary for cc-session tests. Prints the args it was
-# invoked with so tests can assert on argument forwarding, then sleeps
-# so the tmux pane stays alive long enough for further assertions.
+# Stub claude CLI for cc-session bats tests. Prints invoked argv (so
+# tests can assert on argument forwarding), then drives a tiny mock TUI
+# so the post-launch keystroke flow has something observable:
+#
+#   - With "--teleport <id>" in argv, prints a fake "Session resumed /
+#     Resume from summary" prompt so cc-session's resume-key poll
+#     fires within ms.
+#   - Reads stdin line-by-line and emits canned responses for the
+#     resume keys "1" / "2", "/remote-control", and "/compact" — these
+#     are the keystrokes cc-session itself sends.
+#
+# The "is active · Code in CLI or at https://..." line uses session_FAKE
+# + the stub's PID so each test sees a unique synthetic URL.
+
 echo "fake claude args: $*"
-exec sleep 3600
+
+case " $* " in
+  *' --teleport '*)
+    printf '\nSession resumed\n'
+    printf '  Resume from summary (recommended)\n'
+    printf '  Resume full session as-is\n'
+    ;;
+esac
+
+while IFS= read -r line; do
+  case "$line" in
+    "1")
+      echo "fake: resume key 1 received"
+      ;;
+    "2")
+      echo "fake: resume key 2 received"
+      ;;
+    "/remote-control")
+      printf 'Remote Control connecting…\n'
+      printf '/remote-control is active · Code in CLI or at https://claude.ai/code/session_FAKE%05d\n' "$$"
+      ;;
+    "/compact")
+      echo "fake: /compact received"
+      ;;
+    *)
+      ;;
+  esac
+done
