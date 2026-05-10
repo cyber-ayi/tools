@@ -37,10 +37,20 @@ cc-session --kill claude            # terminate the 'claude' session
 cc-session --help                   # full reference
 ```
 
-`claude` is launched with `--remote-control` by default so the session is
-reachable from `claude.ai/code`. Each session cc-session creates is stamped
-with the tmux user option `@cc-session-managed=1` so destructive flags
-(`--teleport`) refuse to touch a same-named session you set up by hand.
+After launch, cc-session enables Remote Control by sending the
+`/remote-control` slash command into the claude TUI (background subshell;
+idempotent). The captured `claude.ai/code/session_xxx` URL is written to
+`$TMPDIR/cc-session/<SESSION_NAME>.url` and flashed in the tmux status
+bar via `tmux display-message`.
+
+Each session cc-session creates is stamped with the tmux user option
+`@cc-session-managed=1` so destructive flags (`--teleport`, `--adopt`)
+refuse to touch a same-named session you set up by hand.
+
+> Why a slash command, not the `--remote-control` startup flag? Because
+> `claude --teleport <id>` silently ignores `--remote-control` at
+> startup. The slash command works uniformly for both teleport and
+> default launches.
 
 ## Tips
 
@@ -65,13 +75,13 @@ dropped. Long sessions (>500k tokens) and sleep / network blips are the
 usual triggers. Recover with:
 
 ```bash
-# Copy the session URL from the browser, then:
-cc-session --teleport https://claude.ai/code/session_0195UVJA1HNCupijDHF8jL7g
-cc-session --teleport session_0195UVJA1HNCupijDHF8jL7g          # bare ID
-cc-session --teleport 0195UVJA1HNCupijDHF8jL7g                  # suffix only
+# Copy the session URL from the browser; the id below is synthetic:
+cc-session --teleport https://claude.ai/code/session_01EXAMPLEabcdef1234567890
+cc-session --teleport session_01EXAMPLEabcdef1234567890         # bare ID
+cc-session --teleport 01EXAMPLEabcdef1234567890                 # suffix only
 
 # Auto-/compact 60s after teleport (pick "summary" in between):
-cc-session --teleport session_0195UVJA1HNCupijDHF8jL7g --compact
+cc-session --teleport session_01EXAMPLEabcdef1234567890 --compact
 
 # Custom delay before /compact:
 CC_SESSION_COMPACT_DELAY=120 cc-session --teleport session_xxx --compact
@@ -79,9 +89,29 @@ CC_SESSION_COMPACT_DELAY=120 cc-session --teleport session_xxx --compact
 
 `--teleport` kills the existing tmux session (only if it carries the
 `@cc-session-managed=1` marker — see above) and starts a new one running
-`claude --remote-control --teleport <id>`. claude pulls the session from
-the cloud, prompts to resume from summary or full transcript, and emits a
-fresh Remote Control link for the browser to reconnect.
+`claude --teleport <id>`. claude pulls the session from the cloud,
+prompts to resume from summary or full transcript, and once it's idle,
+cc-session sends `/remote-control` to surface a *new* claude.ai/code URL.
+
+> Note: the original `session_xxx` URL stays bound to its (now-dead)
+> bridge — refreshing the old browser tab won't help. You'll get a new
+> URL after teleport; cc-session writes it to `$TMPDIR/cc-session/<NAME>.url`
+> and flashes it in the tmux status bar so it's easy to find.
+
+### Adopting an already-running session
+
+If a `cc-session`-managed tmux session is running but isn't visible in
+`claude.ai/code` (e.g. you killed `/remote-control` earlier, or claude
+started without RC), `--adopt` enables RC on the spot:
+
+```bash
+cc-session --adopt                  # default 'claude' tmux session
+cc-session --adopt my-session-name  # custom session name
+```
+
+Idempotent — if RC is already active it just prints the existing URL.
+Refuses to act on tmux sessions without the `@cc-session-managed`
+marker (so it won't poke shells or non-cc-session claude instances).
 
 cc-session **auto-picks "Resume from summary"** (option 1) at the
 post-teleport prompt by polling the pane for the prompt text and sending
@@ -133,7 +163,7 @@ or the cloud.
 brew install bats-core         # macOS
 sudo apt install bats          # Ubuntu
 
-bats cc-session/tests/         # 25 tests, ~5s
+bats cc-session/tests/         # 32 tests, ~10s
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same suite plus a
