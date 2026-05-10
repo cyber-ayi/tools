@@ -33,6 +33,7 @@ Both tools share a common ethos:
 |---|---|---|
 | **backup-verification** | Verify SD-card contents against a NAS backup, with EXIF-aware comparison modes (`smart` / `full` / `data-only`) and multi-threaded SHA-256. | [`backup-verification/`](backup-verification/) |
 | **rclone-migrate** | Safer alternative to `rclone move`: split into `copy → check → delete`, content-addressed matching, persisted hash manifests, audit log, and a check-signature gate that refuses delete if src changed mid-flight. | [`rclone-migrate/`](rclone-migrate/) |
+| **cc-session** | Persistent tmux wrapper for [Claude Code](https://claude.ai/code) — keeps `claude` running across SSH disconnects, sleeps, and devices, so the browser-side "Remote Control" bridge can drop without losing the conversation. | [`cc-session/`](cc-session/) |
 
 Each sub-project has its own `README.md` with a full reference; this
 top-level README is the umbrella entry point.

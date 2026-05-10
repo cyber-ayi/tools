@@ -1,0 +1,140 @@
+#!/bin/zsh
+# Attach to a persistent Claude Code tmux session, or create one.
+
+set -euo pipefail
+
+PROG="${0##*/}"
+
+usage() {
+  cat <<EOF
+NAME
+    $PROG - attach to a persistent Claude Code tmux session
+
+SYNOPSIS
+    $PROG [-d|--detach] [-l|--list] [-k|--kill NAME] [-h|--help]
+              [PROJECT_DIR] [SESSION_NAME]
+
+DESCRIPTION
+    Starts (or re-attaches to) a tmux session running \`claude\` in PROJECT_DIR.
+    Re-running with the same SESSION_NAME re-attaches to the live session, so
+    Claude Code keeps running across SSH disconnects and across devices
+    (e.g. Mac desktop -> phone over Tailscale).
+
+ARGUMENTS
+    PROJECT_DIR     Directory to cd into before launching claude.
+                    Default: \$HOME/cc
+
+    SESSION_NAME    tmux session name. Use distinct names to keep multiple
+                    Claude Code sessions in parallel.
+                    Default: claude
+
+OPTIONS
+    -d, --detach      Start the session in the background and don't attach.
+                      If the session already exists, this is a no-op.
+                      Re-attach later with: $PROG  (without -d).
+    -l, --list        List existing tmux sessions and exit.
+    -k, --kill NAME   Kill the tmux session NAME and exit.
+    -h, --help        Show this help and exit.
+
+ENVIRONMENT
+    CLAUDE_BIN      Path to the claude binary. Auto-detected from
+                    \$HOME/.local/bin/claude, then \$PATH.
+
+EXAMPLES
+    $PROG                          # ~/cc, session 'claude'
+    $PROG ~/work/api               # custom project, session 'claude'
+    $PROG ~/work/api api           # custom project, session 'api'
+    $PROG -d ~/work/api api        # start 'api' detached, return to shell
+    $PROG api                      # later: attach to 'api'
+    $PROG --list                   # show running sessions
+    $PROG --kill claude            # terminate the 'claude' session
+
+TIPS
+    Inside tmux:
+      prefix d        detach (leave claude running in background)
+      prefix [        scroll mode (q to exit)
+      prefix c        new window — gives you a shell; claude keeps running
+      prefix |  / -   split pane (custom binding)
+      prefix n / p    next / previous window
+
+    The session's first pane runs claude directly (no shell). To get a
+    shell without killing claude, open a new window/pane as above, or
+    from outside: tmux new-window -t \$SESSION_NAME
+
+    Re-attach later from any device:
+      ssh mac
+      $PROG
+
+    Resume a Claude conversation (after "Remote Control disconnected",
+    crash, or fresh start). The local transcript is saved on disk even
+    when the browser bridge drops; only the WebSocket to claude.ai/code
+    is lost. Long sessions (>500k tokens) and sleep / network blips are
+    the usual triggers.
+
+      claude --resume <session-id>   # resume a specific session
+      claude --resume                # interactive picker
+      claude -c                      # continue most recent in this dir
+      claude --help                  # full flag list
+
+    When the resume prompt offers it, prefer "resume from summary" over
+    the full transcript so you don't re-pay the entire token count.
+EOF
+}
+
+# --- arg parsing -------------------------------------------------------------
+DETACH=0
+while (( $# )); do
+  case "$1" in
+    -h|--help)
+      usage; exit 0 ;;
+    -l|--list)
+      exec tmux list-sessions ;;
+    -k|--kill)
+      [[ -z "${2:-}" ]] && { echo "$PROG: --kill requires a session name" >&2; exit 2; }
+      exec tmux kill-session -t "$2" ;;
+    -d|--detach)
+      DETACH=1; shift ;;
+    --)
+      shift; break ;;
+    -*)
+      echo "$PROG: unknown option: $1" >&2
+      echo "Try '$PROG --help'." >&2
+      exit 2 ;;
+    *)
+      break ;;
+  esac
+done
+
+PROJECT_DIR="${1:-$HOME/cc}"
+SESSION_NAME="${2:-claude}"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "$PROG: directory not found: $PROJECT_DIR" >&2
+  exit 1
+fi
+
+CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+  CLAUDE_BIN="$(command -v claude || true)"
+fi
+if [[ -z "${CLAUDE_BIN:-}" ]]; then
+  echo "$PROG: claude binary not found (set CLAUDE_BIN or install claude)" >&2
+  exit 1
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "$PROG: tmux not installed (try: brew install tmux)" >&2
+  exit 1
+fi
+
+if (( DETACH )); then
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    echo "$PROG: session '$SESSION_NAME' already running"
+  else
+    tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLAUDE_BIN"
+    echo "$PROG: started '$SESSION_NAME' in $PROJECT_DIR (detached)"
+  fi
+  exit 0
+fi
+
+exec tmux new-session -A -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLAUDE_BIN"
