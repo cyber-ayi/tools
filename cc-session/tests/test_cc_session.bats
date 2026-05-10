@@ -387,20 +387,42 @@ marker_value() {
   assert_contains "$output" "takes at most one positional"
 }
 
-@test "--adopt rejects ULID-shaped arg with --teleport hint" {
-  # 24-char alphanumeric — typical cloud session ID shape (no hyphens
-  # or underscores — those would suggest it's a real tmux name).
-  run "$CC_SESSION" --adopt 01ABCDEFGHIJklmnopqrstuv
-  assert_eq "$status" 2
-  assert_contains "$output" "looks like a cloud session ID"
-  assert_contains "$output" "--teleport"
+@test "--adopt with bare ULID-shaped arg auto-delegates to --teleport flow" {
+  # 24-char alphanumeric — cloud session id shape (no hyphens or
+  # underscores). cc-session should switch to --teleport mode and
+  # run claude --teleport <canonical-id>.
+  run "$CC_SESSION" -d --adopt 01ABCDEFGHIJklmnopqrstuv "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "switching to --teleport mode"
+  args="$(pane_args "$SESSION_NAME")"
+  # parse_session_id prepends session_ to bare suffix
+  assert_contains "$args" -- "--teleport session_01ABCDEFGHIJklmnopqrstuv"
 }
 
-@test "--adopt rejects session_-prefixed arg with --teleport hint" {
-  run "$CC_SESSION" --adopt session_01TESTabc
+@test "--adopt with session_-prefixed arg auto-delegates to --teleport flow" {
+  run "$CC_SESSION" -d --adopt session_01TESTabcdef1234567890 "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "switching to --teleport mode"
+  args="$(pane_args "$SESSION_NAME")"
+  assert_contains "$args" -- "--teleport session_01TESTabcdef1234567890"
+}
+
+@test "--adopt with claude.ai URL auto-delegates and parses URL" {
+  run "$CC_SESSION" -d --adopt "https://claude.ai/code/session_01URLabc1234567890ABCD" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "switching to --teleport mode"
+  args="$(pane_args "$SESSION_NAME")"
+  assert_contains "$args" -- "--teleport session_01URLabc1234567890ABCD"
+}
+
+@test "--adopt tmux-name mode rejects --detach (incompatible)" {
+  # Pre-create managed tmux so adopt would otherwise succeed.
+  tmux new-session -d -s "$SESSION_NAME" -c "$TEST_DIR" "$FAKE_CLAUDE"
+  tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
+  sleep 0.3
+  run "$CC_SESSION" --adopt -d "$SESSION_NAME"
   assert_eq "$status" 2
-  assert_contains "$output" "cloud session ID"
-  assert_contains "$output" "--teleport session_01TESTabc"
+  assert_contains "$output" "incompatible"
 }
 
 @test "--adopt accepts a regular tmux name with hyphens (not flagged as cloud ID)" {

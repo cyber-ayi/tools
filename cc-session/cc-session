@@ -72,24 +72,28 @@ OPTIONS
                       CC_SESSION_SKIP_FULL_CONFIRM=1 to bypass when
                       scripting. Has no effect without --teleport.
 
-    -a, --adopt       Enable Remote Control on an already-running
-                      cc-session-managed tmux session and print the
-                      resulting claude.ai/code URL. Idempotent: if RC
-                      is already active, just prints the existing URL.
-                      Requires the session's claude TUI to be at an
-                      idle prompt (not mid-tool-call, not in a modal).
-                      Refuses to act on tmux sessions without the
-                      @cc-session-managed marker. Mutually exclusive
-                      with --teleport / --detach / --compact / --full.
+    -a, --adopt       Reclaim a session under cc-session control.
+                      The (single, optional) positional decides the
+                      mode automatically based on its shape:
 
-                      Positional convention: --adopt takes at most
-                      ONE positional, the tmux SESSION_NAME (default
-                      'claude') — PROJECT_DIR is irrelevant since
-                      nothing is launched. If the positional looks
-                      like a cloud session ID (20+ char alphanumeric
-                      or session_-prefixed), --adopt rejects it and
-                      hints at --teleport, which is what you want
-                      for reclaiming a cloud-side conversation.
+                      • Tmux session NAME (default 'claude'):
+                        Enable Remote Control on the already-running
+                        cc-session-managed tmux session of that name
+                        and print the claude.ai/code URL. Idempotent
+                        — if RC is already active, just prints the
+                        existing URL. Refuses sessions without the
+                        @cc-session-managed marker. Requires claude
+                        to be at an idle prompt.
+
+                      • Cloud session ID / URL (20+ char alphanumeric,
+                        session_-prefixed, or claude.ai/code URL):
+                        Auto-delegates to --teleport with default cwd
+                        and tmux session name. Use --teleport directly
+                        if you also want --full / --compact / a custom
+                        tmux name.
+
+                      Mutually exclusive with --teleport / --detach /
+                      --compact / --full when in tmux-name mode.
 
     -d, --detach      Start the session in the background and don't attach.
                       If the session already exists, this is a no-op
@@ -346,17 +350,14 @@ if (( RESUME_FULL )) && [[ -z "$TELEPORT_ID" ]]; then
   exit 2
 fi
 
-# --adopt operates on an existing managed tmux session — incompatible
-# with launch flags that spawn / recycle a new process.
-if (( ADOPT )); then
-  if [[ -n "$TELEPORT_ID" ]]; then
-    echo "$PROG: --adopt and --teleport are mutually exclusive" >&2
-    exit 2
-  fi
-  if (( DETACH || RUN_COMPACT || RESUME_FULL )); then
-    echo "$PROG: --adopt is incompatible with --detach / --compact / --full" >&2
-    exit 2
-  fi
+# --adopt is always incompatible with --teleport — pick one entry point.
+# (--detach / --compact / --full vs --adopt are checked later inside the
+#  --adopt block, conditionally on which mode the arg shape lands in:
+#  tmux-name mode rejects them; cloud-id mode auto-delegates to teleport
+#  which uses those flags normally.)
+if (( ADOPT )) && [[ -n "$TELEPORT_ID" ]]; then
+  echo "$PROG: --adopt and --teleport are mutually exclusive" >&2
+  exit 2
 fi
 
 # Confirm --full because it can re-pay the entire conversation's tokens.
@@ -400,45 +401,67 @@ fi
 # arg parsed as PROJECT_DIR and SESSION_NAME defaulted to 'claude' —
 # adopting whatever tmux session happened to be named 'claude'.
 if (( ADOPT )); then
-  if [[ -n "${2:-}" ]]; then
-    echo "$PROG: --adopt takes at most one positional (SESSION_NAME); got 2" >&2
-    echo "       Usage: $PROG --adopt [SESSION_NAME]" >&2
-    exit 2
-  fi
-  SESSION_NAME="${1:-claude}"
-  # Heuristic: a 20+ char pure-alphanumeric (ULID-shape) or
-  # session_-prefixed value is almost certainly a cloud session ID
-  # the user copied from a browser URL — not a tmux session name.
-  # Refuse with a hint at --teleport rather than silently fail to
-  # find a matching tmux session.
-  if [[ "$SESSION_NAME" =~ ^[0-9A-Za-z]{20,}$ ]] || [[ "$SESSION_NAME" == session_* ]]; then
-    echo "$PROG: '$SESSION_NAME' looks like a cloud session ID, not a tmux session name." >&2
-    echo "       --adopt operates on a locally-running tmux session (default name: 'claude')." >&2
-    echo "       To reclaim a cloud-side conversation, use --teleport instead:" >&2
-    echo "         $PROG --teleport $SESSION_NAME" >&2
-    exit 2
-  fi
-  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-    echo "$PROG: tmux session '$SESSION_NAME' does not exist (nothing to adopt)" >&2
+  adopt_arg="${1:-}"
+  # Heuristic: a 20+ char pure-alphanumeric (ULID-shape) value, or
+  # one prefixed with "session_" / starting with the claude.ai URL,
+  # is overwhelmingly a cloud session ID the user copied from a
+  # browser. Auto-delegate to the --teleport launch path so
+  # `cc-session --adopt session_xxx` Just Works for orphaned cloud
+  # sessions — no need to remember the --teleport / --adopt split.
+  if [[ -n "$adopt_arg" ]] && { [[ "$adopt_arg" =~ ^[0-9A-Za-z]{20,}$ ]] \
+       || [[ "$adopt_arg" == session_* ]] \
+       || [[ "$adopt_arg" == https://*claude.ai/code/* ]]; }; then
+    if [[ -n "${4:-}" ]]; then
+      echo "$PROG: --adopt with cloud id takes at most 3 positionals: <cloud-id> [PROJECT_DIR] [SESSION_NAME]" >&2
+      exit 2
+    fi
+    TELEPORT_ID="$(parse_session_id "$adopt_arg")" || exit $?
+    # Re-bind PROJECT_DIR and SESSION_NAME from positionals 2/3
+    # (positional 1 was the cloud-id; the early "${1:-$HOME/cc}"
+    #  binding put the cloud id into PROJECT_DIR, which we don't want).
+    PROJECT_DIR="${2:-$HOME/cc}"
+    SESSION_NAME="${3:-claude}"
+    echo "$PROG: '$adopt_arg' looks like a cloud session id — switching to --teleport mode" >&2
+    echo "       (target tmux session: '$SESSION_NAME', cwd: '$PROJECT_DIR')" >&2
+    ADOPT=0  # fall through to the --teleport launch path below
+  else
+    if [[ -n "${2:-}" ]]; then
+      echo "$PROG: --adopt (tmux-name mode) takes at most one positional; got 2" >&2
+      echo "       Usage: $PROG --adopt [SESSION_NAME]" >&2
+      echo "       (For cloud-session reclaim, pass a session_xxx id or URL instead.)" >&2
+      exit 2
+    fi
+    # tmux-name mode: --detach / --compact / --full make no sense
+    # because we're not launching anything. Reject explicitly so a
+    # `cc-session --adopt -d` typo doesn't silently miss the intent.
+    if (( DETACH || RUN_COMPACT || RESUME_FULL )); then
+      echo "$PROG: --adopt (tmux-name mode) is incompatible with --detach / --compact / --full" >&2
+      echo "       (those flags only apply when --adopt's arg is a cloud session id, which auto-delegates to --teleport.)" >&2
+      exit 2
+    fi
+    SESSION_NAME="${adopt_arg:-claude}"
+    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+      echo "$PROG: tmux session '$SESSION_NAME' does not exist (nothing to adopt)" >&2
+      exit 1
+    fi
+    managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
+    if [[ "$managed" != "1" ]]; then
+      echo "$PROG: refusing to adopt unmanaged tmux session '$SESSION_NAME' (no @cc-session-managed marker)" >&2
+      echo "       cc-session only acts on sessions it created. To bring an" >&2
+      echo "       outside session under management, kill + relaunch it via" >&2
+      echo "         tmux kill-session -t $SESSION_NAME && $PROG ... $SESSION_NAME" >&2
+      exit 1
+    fi
+    if url="$(enable_remote_control "$SESSION_NAME")"; then
+      echo "$PROG: Remote Control on '$SESSION_NAME': $url"
+      mkdir -p "${TMPDIR:-/tmp}/cc-session" 2>/dev/null && \
+        printf '%s\n' "$url" > "${TMPDIR:-/tmp}/cc-session/$SESSION_NAME.url" 2>/dev/null || true
+      exit 0
+    fi
+    echo "$PROG: failed to enable Remote Control on '$SESSION_NAME' within 10s" >&2
+    echo "       Is claude at an idle prompt? Check: tmux attach -t $SESSION_NAME" >&2
     exit 1
   fi
-  managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
-  if [[ "$managed" != "1" ]]; then
-    echo "$PROG: refusing to adopt unmanaged tmux session '$SESSION_NAME' (no @cc-session-managed marker)" >&2
-    echo "       cc-session only acts on sessions it created. To bring an" >&2
-    echo "       outside session under management, kill + relaunch it via" >&2
-    echo "         tmux kill-session -t $SESSION_NAME && $PROG ... $SESSION_NAME" >&2
-    exit 1
-  fi
-  if url="$(enable_remote_control "$SESSION_NAME")"; then
-    echo "$PROG: Remote Control on '$SESSION_NAME': $url"
-    mkdir -p "${TMPDIR:-/tmp}/cc-session" 2>/dev/null && \
-      printf '%s\n' "$url" > "${TMPDIR:-/tmp}/cc-session/$SESSION_NAME.url" 2>/dev/null || true
-    exit 0
-  fi
-  echo "$PROG: failed to enable Remote Control on '$SESSION_NAME' within 10s" >&2
-  echo "       Is claude at an idle prompt? Check: tmux attach -t $SESSION_NAME" >&2
-  exit 1
 fi
 
 if [[ ! -d "$PROJECT_DIR" ]]; then
