@@ -102,6 +102,9 @@ marker_value() {
   assert_contains "$output" "@cc-session-managed"
   assert_contains "$output" CC_SESSION_SKIP_FULL_CONFIRM
   assert_contains "$output" CC_SESSION_COMPACT_DELAY
+  assert_contains "$output" CC_SESSION_RESUME_TIMEOUT
+  assert_contains "$output" CC_SESSION_RC_URL_TIMEOUT
+  assert_contains "$output" CC_SESSION_RC_ENABLE_TIMEOUT
 }
 
 @test "-h is an alias for --help" {

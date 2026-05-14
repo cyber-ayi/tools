@@ -123,6 +123,18 @@ ENVIRONMENT
                                     \$HOME/.local/bin/claude, then \$PATH.
     CC_SESSION_COMPACT_DELAY        Seconds to wait before sending
                                     /compact with --compact. Default: 60.
+    CC_SESSION_RESUME_TIMEOUT       Seconds to wait for the
+                                    "Resume from summary" prompt after
+                                    --teleport before giving up.
+                                    Default: 15. Bump for slow networks
+                                    or large transcripts.
+    CC_SESSION_RC_URL_TIMEOUT       Seconds to wait for the RC URL to
+                                    surface in the pane (server-mode
+                                    default launch). Default: 15.
+    CC_SESSION_RC_ENABLE_TIMEOUT    Seconds to wait for the URL after
+                                    sending the /remote-control slash
+                                    command. Default: 10. Used in the
+                                    --teleport and --adopt paths.
     CC_SESSION_SKIP_FULL_CONFIRM    Set to 1 to skip the "type yes"
                                     confirmation that --full requires.
 
@@ -312,17 +324,20 @@ get_active_rc_url() {
 # Enable Remote Control on a tmux session whose first pane runs claude
 # at an idle prompt. Idempotent: if RC is already active, just returns
 # the current URL. Otherwise sends "/remote-control" via tmux send-keys
-# and polls the pane for up to ~10s waiting for the URL to appear.
-# Echoes the URL on stdout. Returns 1 if no URL surfaces.
+# and polls the pane for up to CC_SESSION_RC_ENABLE_TIMEOUT seconds
+# (default 10) waiting for the URL to appear. Echoes the URL on stdout.
+# Returns 1 if no URL surfaces in time.
 enable_remote_control() {
-  local sess="$1" url _i
+  local sess="$1" url _i timeout iters
   url="$(get_active_rc_url "$sess")"
   if [[ -n "$url" ]]; then
     printf '%s\n' "$url"
     return 0
   fi
   tmux send-keys -t "$sess" "/remote-control" Enter 2>/dev/null || return 1
-  for _i in {1..20}; do
+  timeout="${CC_SESSION_RC_ENABLE_TIMEOUT:-10}"
+  iters=$(( timeout * 2 ))  # 0.5s polling interval
+  for (( _i=0; _i<iters; _i++ )); do
     sleep 0.5
     url="$(get_active_rc_url "$sess")"
     if [[ -n "$url" ]]; then
@@ -616,22 +631,34 @@ fi
 #      $TMPDIR/cc-session/<SESSION>.url and flash it via tmux
 #      display-message so the URL is visible without grepping.
 (
+  resume_timeout="${CC_SESSION_RESUME_TIMEOUT:-15}"
+  url_timeout="${CC_SESSION_RC_URL_TIMEOUT:-15}"
+
   if [[ -n "$TELEPORT_ID" ]]; then
-    for _i in {1..30}; do
+    resume_iters=$(( resume_timeout * 2 ))
+    resume_sent=0
+    for (( _i=0; _i<resume_iters; _i++ )); do
       if tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null \
            | grep -q 'Resume from summary'; then
         tmux send-keys -t "$SESSION_NAME" "$RESUME_KEY" Enter
+        resume_sent=1
         break
       fi
       sleep 0.5
     done
+    if (( ! resume_sent )); then
+      tmux display-message -t "$SESSION_NAME" -d 12000 \
+        "$PROG: WARN — resume prompt not seen in ${resume_timeout}s; bump CC_SESSION_RESUME_TIMEOUT" \
+        2>/dev/null || true
+    fi
     sleep 2  # give resume choice a moment to settle into idle prompt
     url="$(enable_remote_control "$SESSION_NAME")" || url=""
   else
     # Server-mode launch: just poll for the URL the server prints on
     # startup. No keystrokes needed.
     url=""
-    for _i in {1..30}; do
+    url_iters=$(( url_timeout * 2 ))
+    for (( _i=0; _i<url_iters; _i++ )); do
       url="$(get_active_rc_url "$SESSION_NAME")"
       [[ -n "$url" ]] && break
       sleep 0.5
@@ -641,6 +668,14 @@ fi
     write_state_url "$SESSION_NAME" "$url" || true
     tmux display-message -t "$SESSION_NAME" -d 8000 \
       "$PROG: Remote Control: $url" 2>/dev/null || true
+  else
+    # Either teleport's /remote-control didn't surface a URL, or the
+    # server never printed one. Surface a hint so the user — who
+    # likely ran with --detach and won't see this in the foreground —
+    # discovers it on next attach instead of silently getting no URL.
+    tmux display-message -t "$SESSION_NAME" -d 12000 \
+      "$PROG: WARN — no RC URL captured in ${url_timeout}s; check pane manually or bump CC_SESSION_RC_URL_TIMEOUT" \
+      2>/dev/null || true
   fi
 ) >/dev/null 2>&1 &
 
