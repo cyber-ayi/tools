@@ -55,7 +55,7 @@ documented in [Jarvie8176/tools#24](https://github.com/Jarvie8176/tools/issues/2
 SSH into the VPS, clone the tools repo, run the bootstrap script:
 
 ```bash
-ssh me@servarica.tail4a8253.ts.net
+ssh me@servarica   # SSH config alias resolving to your VPS's tailnet hostname
 git clone https://github.com/Jarvie8176/tools.git ~/tools
 ~/tools/cc-session/install/setup-vps.sh
 ```

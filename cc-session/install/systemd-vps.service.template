@@ -75,7 +75,7 @@ StartLimitBurst=5
 
 # Inherit PATH includes Homebrew/Linuxbrew if installed, plus
 # nvm/asdf-managed claude.
-Environment="PATH=/home/%u/.local/bin:/home/%u/.nvm/versions/node/current/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PATH=/home/%u/.local/bin:/home/%u/.npm-global/bin:/home/%u/.nvm/versions/node/current/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
 # Optional: claude binary at non-default location
 # Environment="CLAUDE_BIN=/path/to/claude"
 
