@@ -374,7 +374,14 @@ read_state_url() {
 print_status_one() {
   local sess="$1" alive=no managed=no url="" uptime=""
   if tmux has-session -t "$sess" 2>/dev/null; then
-    alive=yes
+    # remain-on-exit keeps panes around after claude dies, so the
+    # session can outlive its only live process. Count panes whose
+    # process is still running (pane_dead=0).
+    local live_count=0 _pd
+    while IFS= read -r _pd; do
+      [[ "$_pd" == "0" ]] && live_count=$(( live_count + 1 ))
+    done < <(tmux list-panes -s -t "$sess" -F '#{pane_dead}' 2>/dev/null || true)
+    (( live_count > 0 )) && alive=yes
     local marker
     marker="$(tmux show-options -t "$sess" -v '@cc-session-managed' 2>/dev/null || true)"
     [[ "$marker" == "1" ]] && managed=yes
@@ -785,7 +792,23 @@ fi
 created=""
 if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}"
-  tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
+  # Set options only if the session is still here. A claude that crashes
+  # in <a few ms (rare with real claude, possible with stub binaries)
+  # tears the pane down between `new-session` and these calls — without
+  # this guard `set -e` would propagate the inner tmux failure and
+  # cc-session would exit 1 even though "claude crashed" is the very
+  # case we want to surface via --status, not via a shell error.
+  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1' || true
+    # Keep the pane (and its scrollback) around after claude exits so a
+    # crash on startup is debuggable. Without this tmux tears down the
+    # window and the buffer — including any error output — is gone
+    # before anyone can read it. The pane shows "[exited]" in its title
+    # plus a "Pane is dead (status N)" footer; contents remain
+    # capturable via `tmux capture-pane`. User must `cc-session --kill
+    # <name>` (or `tmux kill-session`) to clean up after exit.
+    tmux set-window-option -t "$SESSION_NAME" -q remain-on-exit on || true
+  fi
   created=1
 fi
 
@@ -838,13 +861,18 @@ fi
     sleep 2  # give claude time to open the JSONL and reach idle
     url="$(enable_remote_control "$SESSION_NAME")" || url=""
   else
-    # Server-mode launch: just poll for the URL the server prints on
-    # startup. No keystrokes needed.
+    # Server-mode launch: poll for the URL the server prints on startup.
+    # No keystrokes needed. Bail early if the pane is dead (claude
+    # crashed) so the WARN below fires fast instead of after url_timeout
+    # seconds of pointless polling.
     url=""
     url_iters=$(( url_timeout * 2 ))
     for (( _i=0; _i<url_iters; _i++ )); do
       url="$(get_active_rc_url "$SESSION_NAME")"
       [[ -n "$url" ]] && break
+      pane_dead="$(tmux list-panes -s -t "$SESSION_NAME" \
+                     -F '#{pane_dead}' 2>/dev/null | head -1 || true)"
+      [[ "$pane_dead" == "1" ]] && break
       sleep 0.5
     done
   fi

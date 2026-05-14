@@ -30,6 +30,14 @@ PROG="${0##*/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CC_SESSION="$SCRIPT_DIR/../cc-session"
 
+# Pin claude version. 2.1.141 added a workspace-trust dialog and an
+# `Enable Remote Control? (y/n)` confirmation in front of `claude
+# remote-control` startup, both of which cc-session's unattended polling
+# can't navigate. 2.1.114 is the last known-good version for the bastion
+# (server-mode default launch). Bump deliberately after re-testing
+# `cc-session --status` against a fresh systemd start.
+CLAUDE_VERSION="${CLAUDE_VERSION:-2.1.114}"
+
 log()  { printf '\n[%s] %s\n' "$PROG" "$*"; }
 fail() { printf '\n[%s] ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
 
@@ -48,14 +56,24 @@ bats --version
 
 # --- 2. claude CLI --------------------------------------------------------
 
+if ! command -v npm >/dev/null 2>&1; then
+  fail "npm not found — install node + npm first (apt install nodejs npm OR use nvm)."
+fi
+
+current_claude_version=""
 if command -v claude >/dev/null 2>&1; then
-  log "claude already installed: $(claude --version 2>/dev/null | head -1)"
+  current_claude_version="$(claude --version 2>/dev/null | awk '{print $1}')"
+fi
+
+if [[ "$current_claude_version" == "$CLAUDE_VERSION" ]]; then
+  log "claude already at pinned version $CLAUDE_VERSION"
 else
-  if ! command -v npm >/dev/null 2>&1; then
-    fail "npm not found — install node + npm first (apt install nodejs npm OR use nvm)."
+  if [[ -n "$current_claude_version" ]]; then
+    log "claude $current_claude_version installed, replacing with pinned $CLAUDE_VERSION"
+  else
+    log "Installing claude@${CLAUDE_VERSION} via npm"
   fi
-  log "Installing claude via npm"
-  npm install -g @anthropic-ai/claude-code
+  npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
   command -v claude >/dev/null 2>&1 || fail "claude install succeeded but binary not on PATH"
 fi
 
