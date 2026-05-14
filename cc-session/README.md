@@ -21,8 +21,26 @@ curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/cc-session/cc
 chmod +x ~/bin/cc-session
 ```
 
-Requires `tmux` and the `claude` CLI on `PATH` (or pointed to via
-`CLAUDE_BIN`).
+Runtime requirements:
+- `zsh` (the script's `#!/bin/zsh` shebang)
+- `tmux`
+- `claude` CLI on `PATH` (or pointed to via `CLAUDE_BIN` env var)
+
+Per-OS install:
+
+```bash
+# macOS — zsh ships with the OS; only tmux to install:
+brew install tmux
+
+# Debian / Ubuntu / WSL2:
+sudo apt install -y zsh tmux
+
+# Fedora / RHEL:
+sudo dnf install -y zsh tmux
+```
+
+CI exercises the bats suite on **both** Ubuntu and macOS runners — see
+`.github/workflows/ci.yml`'s `cc-session (bats / <os>)` job.
 
 ## Usage
 
