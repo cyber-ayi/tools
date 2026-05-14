@@ -6,13 +6,6 @@ set -euo pipefail
 PROG="${0##*/}"
 VERSION="0.4.0"
 
-# Seconds of grace between URL capture (= claude reached idle prompt)
-# and sending /compact. Inline constant — not a tunable. The pre-0.4
-# CC_SESSION_COMPACT_DELAY env var existed because the old design
-# couldn't detect idle and used a fixed 60s wall-clock guess. Now that
-# we KNOW idle, 5s is plenty and the var has no real tuning use case.
-COMPACT_POST_URL_GRACE_SECONDS=5
-
 usage() {
   cat <<EOF
 NAME
@@ -94,10 +87,9 @@ OPTIONS
                       \`d8fd4550-d9cc-4ebe-9336-c20b7408afb1\`. Different
                       ID space from cloud session_xxx — don't mix.
 
-    -c, --compact     After the post-launch URL is captured (i.e., once
-                      we know claude has reached an idle prompt), wait
-                      a small grace (5s, hard-coded) and send a
-                      \`/compact\` keystroke into the pane. Requires
+    -c, --compact     Once the post-launch URL is captured (i.e., once
+                      we know claude has reached an idle prompt), send
+                      a \`/compact\` keystroke into the pane. Requires
                       --teleport or --resume, since default launches
                       run the remote-control server which doesn't
                       accept slash commands at its prompt.
@@ -840,13 +832,15 @@ fi
     tmux display-message -t "$SESSION_NAME" -d 8000 \
       "$PROG: Remote Control: $url" 2>/dev/null || true
 
-    # /compact lands here, AFTER URL capture. Successful URL capture
-    # in the teleport / resume path means /remote-control returned,
-    # which means claude is at idle prompt — so /compact will be parsed
-    # instead of dropped on the floor. The small grace lets any final
-    # UI animation settle.
+    # /compact lands here, immediately after URL capture. Successful
+    # URL capture in the teleport / resume path means /remote-control
+    # returned (URL appeared in pane), which means claude processed
+    # the slash command and is back at idle prompt. send-keys queues
+    # /compact into the PTY; claude's input event loop processes it
+    # in order, so even if a sub-second TUI redraw is mid-flight the
+    # bytes get buffered and parsed as a slash command. No artificial
+    # grace period needed.
     if (( RUN_COMPACT )); then
-      sleep "$COMPACT_POST_URL_GRACE_SECONDS"
       tmux send-keys -t "$SESSION_NAME" "/compact" Enter 2>/dev/null || true
     fi
   else
