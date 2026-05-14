@@ -10,7 +10,7 @@
 #
 # What this script does NOT do (require human attention):
 #   - claude OAuth flow needs your browser; script blocks for you
-#   - SSH key from VPS to mbp (use install/setup-bridge-key.sh after)
+#   - SSH key from VPS to the Mac (use install/setup-bridge-key.sh after)
 #   - systemd unit install (template printed; you copy + edit)
 #   - LiteLLM stack (lives in agent-manifest, not cc-session)
 #
@@ -122,6 +122,6 @@ For start-at-boot (not just at user login):
   sudo loginctl enable-linger \$USER
 
 Next steps after this script:
-  - install/setup-bridge-key.sh   — generate SSH key for VPS->mbp tasks
+  - install/setup-bridge-key.sh   — generate SSH key for VPS->macOS host tasks
   - docs/bastion-deployment.md     — end-to-end deployment walkthrough
 "

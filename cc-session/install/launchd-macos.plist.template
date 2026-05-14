@@ -2,12 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 
 <!--
-  cc-session LaunchAgent template — mbp.
+  cc-session LaunchAgent template — macOS host.
 
   PURPOSE
     Bring up cc-session on user login, primarily as a DR fallback for
     the bastion deployment (where the VPS hosts the primary RC entry).
-    On a typical mbp boot/relogin sequence this lets you reach the
+    On a typical macOS boot/relogin sequence this lets you reach the
     Claude session via Tailscale SSH + tmux attach without manually
     re-running cc-session.
 
@@ -17,7 +17,7 @@
     >10min triggering Anthropic-side timeout), restarting it
     immediately just burns through the same failure mode and may
     consume usage quota on retry storms. Better: surface the
-    failure (mbp's tmux session is gone, user notices on next
+    failure (the Mac's tmux session is gone, user notices on next
     `cc-session --status`) and let the human decide.
 
     For aggressive auto-restart, set KeepAlive=true — but expect

@@ -13,7 +13,7 @@
 # WHY Restart=on-failure
 #   On VPS infrastructure (well-managed, stable network) the failure
 #   modes are bounded — primarily Anthropic API outages > 10min, where
-#   restart is the right move. Unlike the mbp LaunchAgent (which uses
+#   restart is the right move. Unlike the macOS LaunchAgent (which uses
 #   KeepAlive=false because user attention is the recovery loop),
 #   here we want auto-recovery because no human is watching.
 #
