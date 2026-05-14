@@ -55,7 +55,7 @@ documented in [Jarvie8176/tools#24](https://github.com/Jarvie8176/tools/issues/2
 SSH into the VPS, clone the tools repo, run the bootstrap script:
 
 ```bash
-ssh me@servarica   # SSH config alias resolving to your VPS's tailnet hostname
+ssh me@<vps>   # SSH config alias resolving to your VPS's tailnet hostname
 git clone https://github.com/Jarvie8176/tools.git ~/tools
 ~/tools/cc-session/install/setup-vps.sh
 ```
@@ -156,7 +156,7 @@ From your phone or a browser on a different machine:
 
 1. Open `claude.ai/code`
 2. The VPS's RC session should appear in the session list, named like
-   `<hostname>-<adjective>-<noun>` (e.g., `servarica-mtl-graceful-unicorn`)
+   `<hostname>-<adjective>-<noun>` (e.g., `myvps-graceful-unicorn`)
 3. Click in, send a prompt that needs macOS host data, e.g.
    `What's the most recent commit message in ~/cc?`
 4. claude on the VPS uses the Bash tool with `ssh me@<macos-host>.your-tailnet.ts.net 'cd ~/cc && git log -1 --format=%s'`
@@ -170,34 +170,34 @@ isn't set up correctly — re-run Step 2 verification.
 ### Status
 
 ```bash
-ssh me@servarica 'cc-session --status'        # VPS-side check
+ssh me@<vps> 'cc-session --status'        # VPS-side check
 ssh me@<macos-host>      'cc-session --status'         # macOS host fallback check
 ```
 
 ### Restart
 
 ```bash
-ssh me@servarica 'systemctl --user restart cc-session'
+ssh me@<vps> 'systemctl --user restart cc-session'
 ```
 
 If the cc-session script itself was updated:
 
 ```bash
-ssh me@servarica 'cd ~/tools && git pull && systemctl --user restart cc-session'
+ssh me@<vps> 'cd ~/tools && git pull && systemctl --user restart cc-session'
 ```
 
 ### Logs
 
 ```bash
-ssh me@servarica 'journalctl --user -u cc-session -f'   # VPS systemd
+ssh me@<vps> 'journalctl --user -u cc-session -f'   # VPS systemd
 ssh me@<macos-host>       'tail -f /tmp/cc-session.{out,err}.log' # macOS host launchd
 ```
 
 ### Stop
 
 ```bash
-ssh me@servarica 'systemctl --user stop cc-session'
-ssh me@servarica 'cc-session --status'   # confirm alive: no
+ssh me@<vps> 'systemctl --user stop cc-session'
+ssh me@<vps> 'cc-session --status'   # confirm alive: no
 ```
 
 ### Recover from "Remote Control disconnected"
@@ -206,7 +206,7 @@ The VPS's RC URL became unresponsive in the browser:
 
 ```bash
 # Grab the session_xxx from the browser URL bar; ssh into VPS:
-ssh me@servarica
+ssh me@<vps>
 cc-session --teleport https://claude.ai/code/session_01XXXXXXXXX
 # Or, if you only have the local UUID (cloud session_xxx is lost):
 cc-session --resume <on-disk-uuid>
