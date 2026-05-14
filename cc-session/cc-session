@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="0.3.0"
+VERSION="0.4.0"
 
 usage() {
   cat <<EOF
@@ -12,7 +12,8 @@ NAME
     $PROG - attach to a persistent Claude Code tmux session
 
 SYNOPSIS
-    $PROG [-t|--teleport ID-OR-URL] [-f|--full] [-c|--compact]
+    $PROG [-t|--teleport ID-OR-URL] [-r|--resume UUID]
+              [-f|--full] [-c|--compact]
               [-d|--detach] [-l|--list] [-k|--kill NAME]
               [--status [SESSION_NAME]]
               [-v|--version] [-h|--help] [PROJECT_DIR] [SESSION_NAME]
@@ -64,6 +65,27 @@ OPTIONS
                         https://claude.ai/code/session_01EXAMPLEab...
                         session_01EXAMPLEab...
                         01EXAMPLEab...
+
+    -r, --resume UUID Resume a LOCAL on-disk session by its UUID and
+                      register a fresh Remote Control URL for it. Use
+                      this when you have only the local UUID (from
+                      \`~/.claude/projects/<proj>/<uuid>.jsonl\` or from
+                      \`claude --resume\` interactive picker) and not
+                      a cloud session_xxx — i.e., the cloud bridge
+                      orphan flow but starting from local state.
+
+                      Same first-turn token cost as --teleport --full
+                      (both load the entire transcript into context).
+                      Use over --teleport when:
+                        - The cloud session_xxx is lost (closed tab,
+                          private window history cleared)
+                        - You want zero cloud-bridge round-trip
+                        - You want to verify a session works locally
+                          before re-registering it remotely
+
+                      UUID is the canonical 8-4-4-4-12 hex form, e.g.
+                      \`d8fd4550-d9cc-4ebe-9336-c20b7408afb1\`. Different
+                      ID space from cloud session_xxx — don't mix.
 
     -c, --compact     After the post-launch URL is captured (i.e., once
                       we know claude has reached an idle prompt), wait
@@ -277,6 +299,21 @@ EOF
 }
 
 # --- helpers -----------------------------------------------------------------
+# Validate an on-disk session UUID for `--resume`. claude stores
+# sessions at `~/.claude/projects/<project>/<uuid>.jsonl`; the uuid is
+# canonical 8-4-4-4-12 hex. Different ID space from cloud session_xxx.
+parse_resume_uuid() {
+  local raw="$1"
+  if [[ ! "$raw" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "$PROG: invalid UUID for --resume: $1" >&2
+    echo "       Expected canonical UUID format (e.g. d8fd4550-d9cc-4ebe-9336-c20b7408afb1)." >&2
+    echo "       This is a LOCAL session id (~/.claude/projects/<proj>/<uuid>.jsonl)," >&2
+    echo "       NOT the cloud session_xxx id; use --teleport for those." >&2
+    return 2
+  fi
+  printf '%s\n' "$raw"
+}
+
 # Normalise a Claude Code session reference into the canonical
 # `session_xxx` form. Accepts a full claude.ai/code URL, the bare
 # `session_xxx` ID, or just the suffix after `session_`.
@@ -453,6 +490,7 @@ enable_remote_control() {
 # --- arg parsing -------------------------------------------------------------
 DETACH=0
 TELEPORT_ID=""
+RESUME_UUID=""
 RUN_COMPACT=0
 RESUME_FULL=0
 ADOPT=0
@@ -495,6 +533,10 @@ while (( $# )); do
       [[ -z "${2:-}" ]] && { echo "$PROG: --teleport requires a session id or URL" >&2; exit 2; }
       TELEPORT_ID="$(parse_session_id "$2")" || exit $?
       shift 2 ;;
+    -r|--resume)
+      [[ -z "${2:-}" ]] && { echo "$PROG: --resume requires a local session UUID" >&2; exit 2; }
+      RESUME_UUID="$(parse_resume_uuid "$2")" || exit $?
+      shift 2 ;;
     -c|--compact)
       RUN_COMPACT=1; shift ;;
     -f|--full)
@@ -512,8 +554,16 @@ while (( $# )); do
   esac
 done
 
+# --teleport / --resume mutually exclusive — both spawn an interactive
+# claude in the same tmux pane; you can't do both.
+if [[ -n "$TELEPORT_ID" ]] && [[ -n "$RESUME_UUID" ]]; then
+  echo "$PROG: --teleport and --resume are mutually exclusive" >&2
+  exit 2
+fi
+
 # --full only makes sense with --teleport (it picks the post-teleport
-# resume option). Refuse silent no-ops.
+# resume option). --resume always loads the full local transcript and
+# has no summary/full prompt to answer. Refuse silent no-ops.
 if (( RESUME_FULL )) && [[ -z "$TELEPORT_ID" ]]; then
   echo "$PROG: --full requires --teleport" >&2
   exit 2
@@ -521,23 +571,27 @@ fi
 
 # --compact sends /compact into the pane after a delay; that only does
 # anything useful for an interactive claude TUI, which we only have on
-# the --teleport path. Default launches now run `claude remote-control`
-# (a server, not an interactive prompt), where typed slash commands
-# wouldn't be parsed. Refuse silent no-ops.
-if (( RUN_COMPACT )) && [[ -z "$TELEPORT_ID" ]]; then
-  echo "$PROG: --compact requires --teleport" >&2
+# the --teleport / --resume paths. Default launches run `claude remote-
+# control` (a server, not an interactive prompt), where typed slash
+# commands wouldn't be parsed. Refuse silent no-ops.
+if (( RUN_COMPACT )) && [[ -z "$TELEPORT_ID" ]] && [[ -z "$RESUME_UUID" ]]; then
+  echo "$PROG: --compact requires --teleport or --resume" >&2
   echo "       (default launches run \`claude remote-control\`, which" >&2
   echo "        doesn't accept slash commands at its prompt.)" >&2
   exit 2
 fi
 
-# --adopt is always incompatible with --teleport — pick one entry point.
+# --adopt incompatible with --teleport / --resume — pick one entry point.
 # (--detach / --compact / --full vs --adopt are checked later inside the
 #  --adopt block, conditionally on which mode the arg shape lands in:
 #  tmux-name mode rejects them; cloud-id mode auto-delegates to teleport
 #  which uses those flags normally.)
 if (( ADOPT )) && [[ -n "$TELEPORT_ID" ]]; then
   echo "$PROG: --adopt and --teleport are mutually exclusive" >&2
+  exit 2
+fi
+if (( ADOPT )) && [[ -n "$RESUME_UUID" ]]; then
+  echo "$PROG: --adopt and --resume are mutually exclusive" >&2
   exit 2
 fi
 
@@ -675,13 +729,17 @@ fi
 #     a specific cloud session in the interactive TUI, and RC is then
 #     enabled on top of it via the slash command.
 CLAUDE_ARGS=()
-if [[ -n "$TELEPORT_ID" ]]; then
-  CLAUDE_ARGS+=(--teleport "$TELEPORT_ID")
-  # --teleport recycles the tmux session — but only if cc-session
-  # created it. We mark managed sessions with the @cc-session-managed
-  # tmux user option (set after new-session below); refuse to kill
-  # anything without that marker so we don't clobber a same-named
-  # session the user set up by hand.
+if [[ -n "$TELEPORT_ID" ]] || [[ -n "$RESUME_UUID" ]]; then
+  if [[ -n "$TELEPORT_ID" ]]; then
+    CLAUDE_ARGS+=(--teleport "$TELEPORT_ID")
+  else
+    CLAUDE_ARGS+=(--resume "$RESUME_UUID")
+  fi
+  # --teleport / --resume both recycle the tmux session — but only if
+  # cc-session created it. We mark managed sessions with the
+  # @cc-session-managed tmux user option (set after new-session below);
+  # refuse to kill anything without that marker so we don't clobber a
+  # same-named session the user set up by hand.
   if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
     if [[ "$managed" != "1" ]]; then
@@ -693,6 +751,8 @@ if [[ -n "$TELEPORT_ID" ]]; then
       exit 1
     fi
     tmux kill-session -t "$SESSION_NAME"
+    # Wipe the now-stale state file too — same hygiene as --kill.
+    remove_state_url "$SESSION_NAME"
   fi
 else
   # Default launch: server-mode RC. Append the subcommand here so the
@@ -740,6 +800,7 @@ fi
   url_timeout="${CC_SESSION_RC_URL_TIMEOUT:-15}"
 
   if [[ -n "$TELEPORT_ID" ]]; then
+    # Teleport: wait for "Resume from summary" prompt, send 1 or 2.
     resume_iters=$(( resume_timeout * 2 ))
     resume_sent=0
     for (( _i=0; _i<resume_iters; _i++ )); do
@@ -757,6 +818,14 @@ fi
         2>/dev/null || true
     fi
     sleep 2  # give resume choice a moment to settle into idle prompt
+    url="$(enable_remote_control "$SESSION_NAME")" || url=""
+  elif [[ -n "$RESUME_UUID" ]]; then
+    # Local resume: claude --resume loads on-disk transcript directly.
+    # No "Resume from summary" prompt here (that's a teleport-only
+    # cloud-side question), but we still need /remote-control to
+    # surface a fresh RC URL since claude --resume has no native RC
+    # registration.
+    sleep 2  # give claude time to open the JSONL and reach idle
     url="$(enable_remote_control "$SESSION_NAME")" || url=""
   else
     # Server-mode launch: just poll for the URL the server prints on

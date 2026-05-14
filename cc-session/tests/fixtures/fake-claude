@@ -17,6 +17,11 @@
 #     URL on the legacy "is active · Code in CLI or at" line), and
 #     "/compact".
 #
+#   - `fake-claude --resume <uuid>` (--resume path): Print a fake
+#     "Session resumed" banner without the summary/full prompt
+#     (claude --resume loads on-disk transcript directly), then drop
+#     into the stdin loop so /remote-control + /compact still work.
+#
 #   - `fake-claude` with no args: legacy interactive mode used by older
 #     --adopt tests that pre-create a managed session by hand. Same
 #     stdin loop, just no startup banner.
@@ -44,6 +49,11 @@ case " $* " in
     printf '\nSession resumed\n'
     printf '  Resume from summary (recommended)\n'
     printf '  Resume full session as-is\n'
+    ;;
+  *' --resume '*)
+    # Local resume: no "Resume from summary" prompt (that's teleport-
+    # only). Just print a banner and drop into the stdin loop.
+    printf '\nSession resumed from on-disk transcript\n'
     ;;
 esac
 

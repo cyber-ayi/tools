@@ -96,6 +96,7 @@ marker_value() {
   assert_contains "$output" NAME
   assert_contains "$output" SYNOPSIS
   assert_contains "$output" -- --teleport
+  assert_contains "$output" -- --resume
   assert_contains "$output" -- --full
   assert_contains "$output" -- --compact
   assert_contains "$output" -- --adopt
@@ -314,6 +315,103 @@ marker_value() {
     assert_contains "$args" -- "--teleport session_TEST123abc"
     tmux kill-session -t "$sess" 2>/dev/null || true
   done
+}
+
+# --- --resume <uuid> ------------------------------------------------
+
+@test "--resume without a uuid exits 2" {
+  run "$CC_SESSION" --resume
+  assert_eq "$status" 2
+  assert_contains "$output" -- "--resume requires a local session UUID"
+}
+
+@test "--resume rejects non-UUID strings" {
+  run "$CC_SESSION" --resume "not-a-uuid"
+  assert_eq "$status" 2
+  assert_contains "$output" "invalid UUID for --resume"
+}
+
+@test "--resume rejects cloud session_xxx ids (different ID space)" {
+  run "$CC_SESSION" --resume "session_01EXAMPLEab1234567890"
+  assert_eq "$status" 2
+  assert_contains "$output" "invalid UUID for --resume"
+  assert_contains "$output" "use --teleport"
+}
+
+@test "--resume accepts canonical UUID and forwards to claude" {
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  args="$(pane_args "$SESSION_NAME")"
+  assert_contains "$args" -- "--resume d8fd4550-d9cc-4ebe-9336-c20b7408afb1"
+}
+
+@test "--resume + --teleport mutually exclusive" {
+  run "$CC_SESSION" --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" --teleport session_TEST
+  assert_eq "$status" 2
+  assert_contains "$output" "mutually exclusive"
+}
+
+@test "--resume + --adopt mutually exclusive" {
+  run "$CC_SESSION" --adopt --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1"
+  assert_eq "$status" 2
+  assert_contains "$output" "mutually exclusive"
+}
+
+@test "--resume + --full exits 2 (--full is teleport-only)" {
+  run "$CC_SESSION" --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" --full
+  assert_eq "$status" 2
+  assert_contains "$output" -- "--full requires --teleport"
+}
+
+@test "--resume launches /remote-control after settle and captures URL" {
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  # fake-claude --resume drops straight into stdin loop. cc-session's
+  # post-launch sends /remote-control which fake-claude responds to
+  # with the session_FAKE URL.
+  wait_for_pane "$SESSION_NAME" "/remote-control is active" 30 \
+    || { echo "fake-claude never received /remote-control after --resume"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; \
+         return 1; }
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$state_file" ] && break
+    sleep 0.5
+  done
+  [ -f "$state_file" ]
+  assert_contains "$(cat "$state_file")" "https://claude.ai/code/session_FAKE"
+}
+
+@test "--resume + --compact: /compact lands after URL capture" {
+  CC_SESSION_COMPACT_DELAY=1 run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" --compact "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  wait_for_pane "$SESSION_NAME" "fake: /compact received" 30 \
+    || { echo "/compact never landed on --resume path"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; \
+         return 1; }
+}
+
+@test "--resume recycles a managed tmux session like --teleport does" {
+  # First create a managed default session
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  old_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
+
+  # Now --resume the same session-name; should recycle (different pid)
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  new_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
+  [ -n "$new_pid" ] && [ "$old_pid" != "$new_pid" ]
+
+  args="$(pane_args "$SESSION_NAME")"
+  assert_contains "$args" -- "--resume d8fd4550-d9cc-4ebe-9336-c20b7408afb1"
+}
+
+@test "--resume refuses to kill an unmanaged tmux session" {
+  tmux new-session -d -s "$SESSION_NAME" -c "$TEST_DIR" "sleep 3600"
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to kill"
 }
 
 # --- --full ----------------------------------------------------------
