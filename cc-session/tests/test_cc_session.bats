@@ -208,6 +208,12 @@ marker_value() {
   assert_contains "$output" -- "--full requires --teleport"
 }
 
+@test "--compact without --teleport exits 2 (server mode rejects slash commands)" {
+  run "$CC_SESSION" --compact
+  assert_eq "$status" 2
+  assert_contains "$output" -- "--compact requires --teleport"
+}
+
 @test "--full with 'no' prints warning, aborts, creates no session" {
   run bash -c "echo no | '$CC_SESSION' -d -t session_TEST --full '$TEST_DIR' '$SESSION_NAME'"
   assert_eq "$status" 1
@@ -270,25 +276,25 @@ marker_value() {
   assert_contains "$args" -- "--teleport session_TEST"
 }
 
-# --- Argument forwarding (default launch passes NO startup flags) ---
+# --- Argument forwarding (default launch uses `remote-control`) ----
 
-@test "default launch passes no startup flags (RC enabled via slash command later)" {
+@test "default launch invokes the remote-control subcommand" {
   run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0
   args="$(pane_args "$SESSION_NAME")"
-  refute_contains "$args" -- "--remote-control"
+  assert_contains "$args" "remote-control"
   refute_contains "$args" -- "--teleport"
 }
 
-# --- Post-launch RC enable (background subshell) --------------------
+# --- Post-launch URL capture (background subshell) ------------------
 
-@test "background flow sends /remote-control and captures URL on default launch" {
+@test "background flow captures the server-mode URL on default launch" {
   run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0
-  # Wait for the background subshell to send /remote-control and for
-  # fake-claude to print the synthetic active line into the pane.
-  wait_for_pane "$SESSION_NAME" "/remote-control is active" 30 \
-    || { echo "Pane never received the expected RC active line:"; \
+  # Server mode: the URL is printed automatically on startup, no
+  # /remote-control keystroke is sent.
+  wait_for_pane "$SESSION_NAME" "https://claude.ai/code?environment=env_FAKE" 30 \
+    || { echo "Pane never received the expected server URL:"; \
          tmux capture-pane -t "$SESSION_NAME" -p; \
          return 1; }
   # State file written at $TMPDIR/cc-session/<NAME>.url
@@ -299,7 +305,20 @@ marker_value() {
   done
   [ -f "$state_file" ]
   url="$(cat "$state_file")"
-  assert_contains "$url" "https://claude.ai/code/session_FAKE"
+  assert_contains "$url" "https://claude.ai/code?environment=env_FAKE"
+}
+
+@test "default launch does NOT send the /remote-control slash command" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  # Give the (now-absent) keystroke flow more than enough time to fire.
+  sleep 3
+  pane="$(tmux capture-pane -t "$SESSION_NAME" -p -S -200)"
+  # fake-claude's remote-control branch echoes any received stdin as
+  # "server stdin: <line>". If cc-session erroneously sends a slash
+  # command into a server-mode pane, it would surface here.
+  refute_contains "$pane" "server stdin: /remote-control"
+  refute_contains "$pane" "/remote-control is active"
 }
 
 @test "background flow sends resume key 1 (summary) when --teleport given" {
@@ -335,14 +354,14 @@ marker_value() {
 }
 
 @test "--adopt fails on nonexistent tmux session" {
-  run "$CC_SESSION" --adopt "$TEST_DIR" "definitely-not-here-$$-$BATS_TEST_NUMBER"
+  run "$CC_SESSION" --adopt "definitely-not-here-$$-$BATS_TEST_NUMBER"
   assert_eq "$status" 1
   assert_contains "$output" "does not exist"
 }
 
 @test "--adopt refuses an unmanaged tmux session" {
   tmux new-session -d -s "$SESSION_NAME" -c "$TEST_DIR" "sleep 3600"
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 1
   assert_contains "$output" "refusing to adopt unmanaged"
   assert_contains "$output" "@cc-session-managed marker"
@@ -355,7 +374,7 @@ marker_value() {
   tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
   sleep 0.5  # let fake-claude reach its read loop
 
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 0
   assert_contains "$output" "Remote Control on '$SESSION_NAME'"
   assert_contains "$output" "https://claude.ai/code/session_FAKE"
@@ -370,15 +389,70 @@ marker_value() {
   tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
   sleep 0.5
 
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 0
   url1="$(printf '%s\n' "$output" | grep -oE 'https://claude\.ai/code/session_FAKE[0-9]+')"
 
-  run "$CC_SESSION" --adopt "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
   assert_eq "$status" 0
   url2="$(printf '%s\n' "$output" | grep -oE 'https://claude\.ai/code/session_FAKE[0-9]+')"
 
   assert_eq "$url1" "$url2"
+}
+
+@test "--adopt rejects 2 positionals (tmux-name mode is single-positional)" {
+  run "$CC_SESSION" --adopt some-dir some-session
+  assert_eq "$status" 2
+  assert_contains "$output" "takes at most one positional"
+}
+
+@test "--adopt with bare ULID-shaped arg auto-delegates to --teleport flow" {
+  # 24-char alphanumeric — cloud session id shape (no hyphens or
+  # underscores). cc-session should switch to --teleport mode and
+  # run claude --teleport <canonical-id>.
+  run "$CC_SESSION" -d --adopt 01ABCDEFGHIJklmnopqrstuv "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "switching to --teleport mode"
+  args="$(pane_args "$SESSION_NAME")"
+  # parse_session_id prepends session_ to bare suffix
+  assert_contains "$args" -- "--teleport session_01ABCDEFGHIJklmnopqrstuv"
+}
+
+@test "--adopt with session_-prefixed arg auto-delegates to --teleport flow" {
+  run "$CC_SESSION" -d --adopt session_01TESTabcdef1234567890 "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "switching to --teleport mode"
+  args="$(pane_args "$SESSION_NAME")"
+  assert_contains "$args" -- "--teleport session_01TESTabcdef1234567890"
+}
+
+@test "--adopt with claude.ai URL auto-delegates and parses URL" {
+  run "$CC_SESSION" -d --adopt "https://claude.ai/code/session_01URLabc1234567890ABCD" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "switching to --teleport mode"
+  args="$(pane_args "$SESSION_NAME")"
+  assert_contains "$args" -- "--teleport session_01URLabc1234567890ABCD"
+}
+
+@test "--adopt accepts a regular tmux name with hyphens (not flagged as cloud ID)" {
+  # Even though >20 chars, hyphens disqualify the ULID heuristic.
+  long_name="my-very-long-tmux-session-name"
+  run "$CC_SESSION" --adopt "$long_name"
+  # Will fail with "does not exist" (no such tmux session) — which is
+  # the right error class. The point: not flagged as cloud ID.
+  assert_eq "$status" 1
+  assert_contains "$output" "does not exist"
+  refute_contains "$output" "cloud session"
+}
+
+@test "--adopt tmux-name mode rejects --detach (incompatible)" {
+  # Pre-create managed tmux so adopt would otherwise succeed.
+  tmux new-session -d -s "$SESSION_NAME" -c "$TEST_DIR" "$FAKE_CLAUDE"
+  tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1'
+  sleep 0.3
+  run "$CC_SESSION" --adopt -d "$SESSION_NAME"
+  assert_eq "$status" 2
+  assert_contains "$output" "incompatible"
 }
 
 # --- Error paths -----------------------------------------------------

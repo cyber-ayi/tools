@@ -37,20 +37,38 @@ cc-session --kill claude            # terminate the 'claude' session
 cc-session --help                   # full reference
 ```
 
-After launch, cc-session enables Remote Control by sending the
-`/remote-control` slash command into the claude TUI (background subshell;
-idempotent). The captured `claude.ai/code/session_xxx` URL is written to
-`$TMPDIR/cc-session/<SESSION_NAME>.url` and flashed in the tmux status
-bar via `tmux display-message`.
+After launch, the URL `claude.ai/code` should open the conversation
+on is captured from the pane and written to
+`$TMPDIR/cc-session/<SESSION_NAME>.url`, plus flashed in the tmux
+status bar via `tmux display-message`.
 
 Each session cc-session creates is stamped with the tmux user option
 `@cc-session-managed=1` so destructive flags (`--teleport`, `--adopt`)
 refuse to touch a same-named session you set up by hand.
 
-> Why a slash command, not the `--remote-control` startup flag? Because
-> `claude --teleport <id>` silently ignores `--remote-control` at
-> startup. The slash command works uniformly for both teleport and
-> default launches.
+### Launch modes
+
+| Mode                | Tmux pane command           | URL shape                                       |
+|---------------------|-----------------------------|-------------------------------------------------|
+| Default (v0.3.0+)   | `claude remote-control`     | `https://claude.ai/code?environment=env_<id>`   |
+| `--teleport <id>`   | `claude --teleport <id>`    | `https://claude.ai/code/session_<id>`           |
+
+The default launch runs the dedicated `claude remote-control`
+subcommand — a persistent multi-session server that prints its URL
+on startup. No keystrokes are scripted into the pane.
+
+The `--teleport` path is different: `claude remote-control` doesn't
+accept a teleport id, so cc-session launches the interactive
+`claude --teleport <id>` and bridges it to claude.ai/code by sending
+`/remote-control` as a slash command once the TUI reaches an idle
+prompt.
+
+> Prior versions (≤ 0.2.x) ran a bare `claude` interactive TUI in
+> tmux and used `/remote-control` for *every* launch. That path left
+> a dangling JSONL session per launch in `~/.claude/projects/...`
+> (the TUI's original session was abandoned the moment the slash
+> command transitioned it away). The server-mode default in 0.3.0+
+> avoids the orphan.
 
 ## Tips
 
@@ -67,79 +85,120 @@ killing claude:
 
 Or from outside: `tmux new-window -t <SESSION_NAME>`.
 
-### Recovering a stuck Remote Control session
+## Use case: reclaim an orphaned cloud session
 
-When the browser shows **"Remote Control disconnected"**, the local
-transcript is still safe — only the WebSocket bridge to `claude.ai/code`
-dropped. Long sessions (>500k tokens) and sleep / network blips are the
-usual triggers. Recover with:
+You're working on `claude.ai/code/session_xxx` from a browser; mid-turn,
+the page changes to:
+
+> **Remote Control disconnected**
+> Your terminal's Claude Code session stopped responding. Check your
+> terminal for errors, then resend your message.
+
+The local `claude` process can no longer talk to the cloud-side bridge.
+The conversation **transcript is not lost** — it's persisted both
+on-disk under `~/.claude/projects/.../<uuid>.jsonl` and in the cloud —
+but the browser tab is now bound to a bridge that won't recover even
+with a refresh. The session is *orphaned*: alive in storage, but
+unreachable from any UI.
+
+`cc-session --teleport` reclaims it by pulling the cloud transcript
+into a fresh local claude process and registering a new RC URL.
+
+### Steps
+
+**1. From the browser, copy the orphaned session URL.**
+
+It's the address bar of the disconnected tab:
+
+```
+https://claude.ai/code/session_01EXAMPLEabcdef1234567890
+```
+
+(Or right-click the session in the sidebar → "Copy link", if your
+client surfaces that.)
+
+**2. From a terminal on the host running cc-session** (likely via SSH
++ tmux from another device):
 
 ```bash
-# Copy the session URL from the browser; the id below is synthetic:
 cc-session --teleport https://claude.ai/code/session_01EXAMPLEabcdef1234567890
-cc-session --teleport session_01EXAMPLEabcdef1234567890         # bare ID
-cc-session --teleport 01EXAMPLEabcdef1234567890                 # suffix only
-
-# Auto-/compact 60s after teleport (pick "summary" in between):
-cc-session --teleport session_01EXAMPLEabcdef1234567890 --compact
-
-# Custom delay before /compact:
-CC_SESSION_COMPACT_DELAY=120 cc-session --teleport session_xxx --compact
 ```
 
-`--teleport` kills the existing tmux session (only if it carries the
-`@cc-session-managed=1` marker — see above) and starts a new one running
-`claude --teleport <id>`. claude pulls the session from the cloud,
-prompts to resume from summary or full transcript, and once it's idle,
-cc-session sends `/remote-control` to surface a *new* claude.ai/code URL.
-
-> Note: the original `session_xxx` URL stays bound to its (now-dead)
-> bridge — refreshing the old browser tab won't help. You'll get a new
-> URL after teleport; cc-session writes it to `$TMPDIR/cc-session/<NAME>.url`
-> and flashes it in the tmux status bar so it's easy to find.
-
-### Adopting an already-running session
-
-If a `cc-session`-managed tmux session is running but isn't visible in
-`claude.ai/code` (e.g. you killed `/remote-control` earlier, or claude
-started without RC), `--adopt` enables RC on the spot:
+Three input shapes are accepted; cc-session canonicalizes them all to
+`session_<id>`:
 
 ```bash
+cc-session --teleport https://claude.ai/code/session_01EXAMPLEabcdef1234567890   # full URL
+cc-session --teleport session_01EXAMPLEabcdef1234567890                          # bare ID
+cc-session --teleport 01EXAMPLEabcdef1234567890                                  # suffix only
+```
+
+cc-session will (in this order):
+
+1. Kill the same-named tmux session **only if** it was created by
+   cc-session (`@cc-session-managed=1`); recreate it fresh.
+2. Launch `claude --teleport <id>`, which fetches the cloud transcript.
+3. Wait for the **"Resume from summary / Resume full session as-is"**
+   prompt and auto-pick option 1 (summary). Override with `--full` if
+   you really want to re-pay the full token cost (asks for `yes`
+   confirmation; bypass with `CC_SESSION_SKIP_FULL_CONFIRM=1`).
+4. Once claude is back at an idle prompt, send `/remote-control` to
+   register a new Remote Control URL with `claude.ai/code`.
+5. Write the new URL to `$TMPDIR/cc-session/<SESSION_NAME>.url` and
+   flash it in the tmux status bar via `tmux display-message`.
+
+**3. Open the new URL** (the one cc-session printed) in your browser.
+The conversation is back, prefaced by a "Session resumed" marker and a
+summary of the prior context.
+
+> ⚠️ **The original `session_xxx` URL stays bound to its (now-dead)
+> bridge.** Refreshing the old browser tab keeps showing the disconnect
+> message — that URL is essentially a pointer to the bridge process,
+> not the conversation. The new URL is the only live one going forward.
+
+### Variations
+
+```bash
+# Resume the FULL transcript (re-pays all tokens; prompts for "yes"):
+cc-session --teleport <url> --full
+
+# Auto-/compact 60s after teleport to free context for follow-up work:
+cc-session --teleport <url> --compact
+
+# Custom /compact delay (e.g. 2 minutes — gives long fetches more slack):
+CC_SESSION_COMPACT_DELAY=120 cc-session --teleport <url> --compact
+
+# A cc-session-managed session is already running but RC isn't visible
+# in claude.ai/code (e.g. /remote-control was never invoked, or you
+# disconnected it earlier) — just register a fresh RC URL on the spot:
 cc-session --adopt                  # default 'claude' tmux session
-cc-session --adopt my-session-name  # custom session name
+cc-session --adopt my-session       # named session
 ```
 
-Idempotent — if RC is already active it just prints the existing URL.
-Refuses to act on tmux sessions without the `@cc-session-managed`
-marker (so it won't poke shells or non-cc-session claude instances).
+`--adopt` is idempotent: if RC is already active (always the case for
+default-launched server-mode sessions; usually the case for previously
+adopted teleport sessions), it just prints the existing URL by
+reading the pane scrollback. Only falls through to a `/remote-control`
+keystroke when the URL isn't already visible in the pane.
 
-cc-session **auto-picks "Resume from summary"** (option 1) at the
-post-teleport prompt by polling the pane for the prompt text and sending
-the keystroke once it shows. To resume the full transcript instead, pass
-`--full`:
+### What if the URL is "lost"?
+
+If you can't get the orphaned URL from the browser — tab was closed,
+session in private window with cleared history, etc. — there is no
+local equivalent. The on-disk session UUID
+(`~/.claude/projects/.../<uuid>.jsonl`) is a *different ID space* from
+the cloud `session_xxx` and can't be used with `--teleport`. You'd
+fall back to:
 
 ```bash
-cc-session --teleport session_xxx --full
-# Prompts: Type "yes" to continue with --full:
-#   - because full resume can re-pay the entire conversation's tokens
-
-# In scripts, skip the confirmation:
-CC_SESSION_SKIP_FULL_CONFIRM=1 cc-session --teleport session_xxx --full -d
+claude --resume <on-disk-uuid>     # local-only resume; no RC URL
+claude --resume                    # interactive picker
 ```
 
-You can also resume locally without teleport, by the on-disk session UUID
-(different ID space from `session_xxx`):
+— and then enable RC manually with `cc-session --adopt` once that
+claude is up.
 
-```bash
-claude --resume <uuid>     # resume by ID
-claude --resume            # interactive picker
-claude -c                  # continue most recent in this dir
-```
-
-When the resume prompt offers it, prefer **"resume from summary"** over the
-full transcript so you don't re-pay the entire token count.
-
-### Avoiding sleep-induced drops
+## Avoiding sleep-induced drops
 
 On macOS, `caffeinate -i` blocks idle sleep for the lifetime of the wrapped
 process:
