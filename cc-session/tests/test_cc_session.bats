@@ -102,7 +102,6 @@ marker_value() {
   assert_contains "$output" -- --adopt
   assert_contains "$output" "@cc-session-managed"
   assert_contains "$output" CC_SESSION_SKIP_FULL_CONFIRM
-  assert_contains "$output" CC_SESSION_COMPACT_DELAY
   assert_contains "$output" CC_SESSION_RESUME_TIMEOUT
   assert_contains "$output" CC_SESSION_RC_URL_TIMEOUT
   assert_contains "$output" CC_SESSION_RC_ENABLE_TIMEOUT
@@ -383,7 +382,7 @@ marker_value() {
 }
 
 @test "--resume + --compact: /compact lands after URL capture" {
-  CC_SESSION_COMPACT_DELAY=1 run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" --compact "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" --compact "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0
   wait_for_pane "$SESSION_NAME" "fake: /compact received" 30 \
     || { echo "/compact never landed on --resume path"; \
@@ -536,8 +535,7 @@ marker_value() {
 }
 
 @test "/compact fires AFTER URL capture, not on a fixed delay" {
-  # Use a short compact delay so the test doesn't wait long.
-  CC_SESSION_COMPACT_DELAY=1 run "$CC_SESSION" -d -t session_TEST --compact "$TEST_DIR" "$SESSION_NAME"
+  run "$CC_SESSION" -d -t session_TEST --compact "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0
   # First the URL must be captured (proving claude reached idle).
   state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"

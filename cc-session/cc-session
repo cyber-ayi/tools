@@ -6,6 +6,13 @@ set -euo pipefail
 PROG="${0##*/}"
 VERSION="0.4.0"
 
+# Seconds of grace between URL capture (= claude reached idle prompt)
+# and sending /compact. Inline constant — not a tunable. The pre-0.4
+# CC_SESSION_COMPACT_DELAY env var existed because the old design
+# couldn't detect idle and used a fixed 60s wall-clock guess. Now that
+# we KNOW idle, 5s is plenty and the var has no real tuning use case.
+COMPACT_POST_URL_GRACE_SECONDS=5
+
 usage() {
   cat <<EOF
 NAME
@@ -89,11 +96,11 @@ OPTIONS
 
     -c, --compact     After the post-launch URL is captured (i.e., once
                       we know claude has reached an idle prompt), wait
-                      CC_SESSION_COMPACT_DELAY seconds (default 5) and
-                      send a \`/compact\` keystroke into the pane.
-                      Requires --teleport, since default launches run
-                      the remote-control server which doesn't accept
-                      slash commands at its prompt.
+                      a small grace (5s, hard-coded) and send a
+                      \`/compact\` keystroke into the pane. Requires
+                      --teleport or --resume, since default launches
+                      run the remote-control server which doesn't
+                      accept slash commands at its prompt.
 
                       If URL capture fails, /compact is skipped (with
                       a tmux display-message warning) — claude's state
@@ -160,14 +167,6 @@ ENVIRONMENT
     CLAUDE_BIN                      Path to the claude binary.
                                     Auto-detected from
                                     \$HOME/.local/bin/claude, then \$PATH.
-    CC_SESSION_COMPACT_DELAY        Seconds to wait AFTER the RC URL
-                                    is captured (i.e., after claude
-                                    reaches idle prompt) before sending
-                                    /compact with --compact. Default: 5.
-                                    Pre-0.4 the default was 60s because
-                                    we couldn't detect idle and used a
-                                    fixed delay — now the delay is just
-                                    a small grace period.
     CC_SESSION_RESUME_TIMEOUT       Seconds to wait for the
                                     "Resume from summary" prompt after
                                     --teleport before giving up.
@@ -235,11 +234,9 @@ EXAMPLES
     $PROG -t session_01EXAMPLEabcdef1234567890         # same effect
     $PROG -t 01EXAMPLEabcdef1234567890                 # bare ID also OK
 
-    # Teleport + auto /compact 60s later (summary auto-picked first):
+    # Teleport + auto /compact (summary auto-picked first; /compact
+    # fires shortly after URL capture, no delay needed):
     $PROG -t session_01EXAMPLEabcdef1234567890 -c
-
-    # Custom /compact delay:
-    CC_SESSION_COMPACT_DELAY=120 $PROG -t session_xxx -c
 
     # Resume the FULL transcript (asks for 'yes' confirmation):
     $PROG -t session_xxx --full
@@ -844,16 +841,12 @@ fi
       "$PROG: Remote Control: $url" 2>/dev/null || true
 
     # /compact lands here, AFTER URL capture. Successful URL capture
-    # in the teleport path means /remote-control returned, which means
-    # claude is at idle prompt — so /compact will be parsed instead
-    # of dropped on the floor. The small grace (default 5s) just lets
-    # any final UI animation settle.
-    #
-    # CC_SESSION_COMPACT_DELAY remains an env var for back-compat (old
-    # default was 60s, reflecting a fixed-delay world where we couldn't
-    # detect idle). Now that we KNOW idle, 5s is plenty.
+    # in the teleport / resume path means /remote-control returned,
+    # which means claude is at idle prompt — so /compact will be parsed
+    # instead of dropped on the floor. The small grace lets any final
+    # UI animation settle.
     if (( RUN_COMPACT )); then
-      sleep "${CC_SESSION_COMPACT_DELAY:-5}"
+      sleep "$COMPACT_POST_URL_GRACE_SECONDS"
       tmux send-keys -t "$SESSION_NAME" "/compact" Enter 2>/dev/null || true
     fi
   else

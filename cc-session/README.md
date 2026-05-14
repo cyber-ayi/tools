@@ -162,11 +162,10 @@ summary of the prior context.
 # Resume the FULL transcript (re-pays all tokens; prompts for "yes"):
 cc-session --teleport <url> --full
 
-# Auto-/compact 60s after teleport to free context for follow-up work:
+# Auto-/compact after teleport to free context for follow-up work
+# (fires shortly after the new RC URL is captured — no fixed delay
+# in 0.4+; the cc-session script knows when claude has reached idle):
 cc-session --teleport <url> --compact
-
-# Custom /compact delay (e.g. 2 minutes — gives long fetches more slack):
-CC_SESSION_COMPACT_DELAY=120 cc-session --teleport <url> --compact
 
 # A cc-session-managed session is already running but RC isn't visible
 # in claude.ai/code (e.g. /remote-control was never invoked, or you
