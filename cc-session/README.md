@@ -88,6 +88,19 @@ prompt.
 > command transitioned it away). The server-mode default in 0.3.0+
 > avoids the orphan.
 
+## Bastion deployment (VPS RC entry, macOS host as data plane)
+
+For the topology where a Tailscale-reachable VPS hosts the public
+`claude.ai/code` URL and SSHes into the macOS host for tasks needing local data:
+
+- Install templates in [`install/`](install/):
+  - [`launchd-macos.plist.template`](install/launchd-macos.plist.template) — macOS DR fallback
+  - [`systemd-vps.service.template`](install/systemd-vps.service.template) — VPS primary
+  - [`setup-vps.sh`](install/setup-vps.sh) — bootstrap script for fresh VPS
+  - [`setup-bridge-key.sh`](install/setup-bridge-key.sh) — VPS→macOS host SSH bridge keypair
+- End-to-end walkthrough: [`docs/bastion-deployment.md`](docs/bastion-deployment.md)
+- Threat model: [`docs/threat-model.md`](docs/threat-model.md)
+
 ## Tips
 
 The first pane runs `claude` directly with no shell. To get a shell without
