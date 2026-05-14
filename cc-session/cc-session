@@ -14,6 +14,7 @@ NAME
 SYNOPSIS
     $PROG [-t|--teleport ID-OR-URL] [-f|--full] [-c|--compact]
               [-d|--detach] [-l|--list] [-k|--kill NAME]
+              [--status [SESSION_NAME]]
               [-v|--version] [-h|--help] [PROJECT_DIR] [SESSION_NAME]
     $PROG -a|--adopt [SESSION_NAME]
 
@@ -113,7 +114,17 @@ OPTIONS
                       recycles the session).
                       Re-attach later with: $PROG  (without -d).
     -l, --list        List existing tmux sessions and exit.
-    -k, --kill NAME   Kill the tmux session NAME and exit.
+    -k, --kill NAME   Kill the tmux session NAME and exit. Also removes
+                      the cached \`<NAME>.url\` state file so monitoring
+                      tools and browser bookmarks don't reconnect to a
+                      now-dead RC environment.
+    --status [NAME]   Print machine-parseable status for one or all
+                      managed sessions. Output is 5 lines per session:
+                      session, alive, managed, url, uptime_seconds.
+                      With no NAME, walks every tmux session carrying
+                      \`@cc-session-managed=1\`. Exit 0 iff at least one
+                      inspected session is alive. Safe to call from
+                      monitoring loops.
     -v, --version     Print version ($PROG $VERSION) and exit.
     -h, --help        Show this help and exit.
 
@@ -300,6 +311,75 @@ remove_state_url() {
   rm -f "$(state_file_for "$sess")" 2>/dev/null || true
 }
 
+# Read the current state URL for $1, or empty if no state file.
+read_state_url() {
+  local f
+  f="$(state_file_for "$1")"
+  [[ -f "$f" ]] && cat "$f" 2>/dev/null || true
+}
+
+# Print human-readable + machine-parseable status for one or all
+# managed sessions. Used by --status; meant to be safe to call from
+# monitoring scripts on a tight loop.
+#
+# When called with a session name, output 5 lines:
+#   session: <name>
+#   alive: yes|no
+#   managed: yes|no
+#   url: <url-or-empty>
+#   uptime_seconds: <int-or-empty>
+# Exit 0 if alive, 1 if not.
+#
+# When called with no arg, prints the same block for every tmux
+# session that carries the @cc-session-managed marker. Exit 0 if any
+# managed session is alive, 1 otherwise.
+print_status_one() {
+  local sess="$1" alive=no managed=no url="" uptime=""
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    alive=yes
+    local marker
+    marker="$(tmux show-options -t "$sess" -v '@cc-session-managed' 2>/dev/null || true)"
+    [[ "$marker" == "1" ]] && managed=yes
+    url="$(read_state_url "$sess")"
+    # tmux session creation time as epoch -> uptime in seconds
+    local created_epoch now_epoch
+    created_epoch="$(tmux display-message -p -t "$sess" '#{session_created}' 2>/dev/null || true)"
+    if [[ -n "$created_epoch" ]]; then
+      now_epoch=$(date +%s)
+      uptime=$(( now_epoch - created_epoch ))
+    fi
+  else
+    # Even if tmux session is gone, a stale state file may exist.
+    url="$(read_state_url "$sess")"
+  fi
+  printf 'session: %s\n' "$sess"
+  printf 'alive: %s\n' "$alive"
+  printf 'managed: %s\n' "$managed"
+  printf 'url: %s\n' "$url"
+  printf 'uptime_seconds: %s\n' "$uptime"
+  [[ "$alive" == yes ]] && return 0 || return 1
+}
+
+print_status_all() {
+  local found_alive=0 first=1 sess
+  while IFS= read -r sess; do
+    [[ -z "$sess" ]] && continue
+    local marker
+    marker="$(tmux show-options -t "$sess" -v '@cc-session-managed' 2>/dev/null || true)"
+    [[ "$marker" != "1" ]] && continue
+    (( first )) || printf -- '---\n'
+    first=0
+    if print_status_one "$sess"; then
+      found_alive=1
+    fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+  if (( first )); then
+    echo "no managed sessions" >&2
+    return 1
+  fi
+  return $(( found_alive ? 0 : 1 ))
+}
+
 # Pattern for Remote Control URLs surfaced in claude's TUI. Two shapes
 # appear in the wild:
 #   1. Server mode (claude remote-control):
@@ -372,6 +452,19 @@ while (( $# )); do
       printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
     -l|--list)
       exec tmux list-sessions ;;
+    --status)
+      # --status [SESSION_NAME]
+      # Prints 5-line block (session/alive/managed/url/uptime_seconds)
+      # per session. With no arg: every managed session. Exit 0 iff at
+      # least one inspected session is alive.
+      shift
+      if [[ -n "${1:-}" ]]; then
+        print_status_one "$1"
+        exit $?
+      else
+        print_status_all
+        exit $?
+      fi ;;
     -k|--kill)
       [[ -z "${2:-}" ]] && { echo "$PROG: --kill requires a session name" >&2; exit 2; }
       # Clean state file alongside the tmux session — a stale .url

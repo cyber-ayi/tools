@@ -173,6 +173,71 @@ marker_value() {
   [ ! -f "$state_file" ]
 }
 
+# --- --status -------------------------------------------------------
+
+@test "--status on a live managed session: alive=yes, url present, uptime>0" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  # Wait for state file (URL captured).
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$state_file" ] && break
+    sleep 0.5
+  done
+  [ -f "$state_file" ]
+  sleep 1  # ensure uptime_seconds is non-zero
+
+  run "$CC_SESSION" --status "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "session: $SESSION_NAME"
+  assert_contains "$output" "alive: yes"
+  assert_contains "$output" "managed: yes"
+  assert_contains "$output" "https://claude.ai/code?environment=env_FAKE"
+  # uptime_seconds: <int> with int >= 0
+  [[ "$output" =~ uptime_seconds:\ ([0-9]+) ]] && [ "${BASH_REMATCH[1]}" -ge 0 ]
+}
+
+@test "--status on a nonexistent session: alive=no, exit 1" {
+  run "$CC_SESSION" --status "definitely-not-here-$$"
+  assert_eq "$status" 1
+  assert_contains "$output" "alive: no"
+  assert_contains "$output" "managed: no"
+}
+
+@test "--status surfaces stale state file even when tmux session is gone" {
+  # Plant a stale state file from some prior cc-session run.
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  mkdir -p "$(dirname "$state_file")"
+  printf 'https://claude.ai/code/session_STALE12345\n' > "$state_file"
+
+  run "$CC_SESSION" --status "$SESSION_NAME"
+  assert_eq "$status" 1
+  assert_contains "$output" "alive: no"
+  # url field still emits the stale URL — caller can spot the staleness
+  # because alive=no.
+  assert_contains "$output" "session_STALE12345"
+}
+
+@test "--status with no arg lists every managed session, exits 0 if any alive" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  sleep 1
+
+  run "$CC_SESSION" --status
+  assert_eq "$status" 0
+  assert_contains "$output" "session: $SESSION_NAME"
+  assert_contains "$output" "alive: yes"
+}
+
+@test "--status with no arg + no managed sessions exits 1 with 'no managed' message" {
+  # Pre-create an UNMANAGED tmux session so it's filtered out.
+  tmux new-session -d -s "$SESSION_NAME" -c "$TEST_DIR" "sleep 3600"
+  run "$CC_SESSION" --status
+  assert_eq "$status" 1
+  assert_contains "$output" "no managed sessions"
+  refute_contains "$output" "session: $SESSION_NAME"
+}
+
 @test "state file written via tmpfile-then-rename (atomic)" {
   # Spawn a session, wait for state to land, then verify no .tmp.* file
   # was left behind in the state dir (would indicate an interrupted write).
