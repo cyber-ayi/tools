@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="0.2.0"
+VERSION="0.4.0"
 
 usage() {
   cat <<EOF
@@ -12,23 +12,32 @@ NAME
     $PROG - attach to a persistent Claude Code tmux session
 
 SYNOPSIS
-    $PROG [-t|--teleport ID-OR-URL] [-f|--full] [-c|--compact]
-              [-a|--adopt] [-d|--detach] [-l|--list] [-k|--kill NAME]
+    $PROG [-t|--teleport ID-OR-URL] [-r|--resume UUID]
+              [-f|--full] [-c|--compact]
+              [-d|--detach] [-l|--list] [-k|--kill NAME]
+              [--status [SESSION_NAME]]
               [-v|--version] [-h|--help] [PROJECT_DIR] [SESSION_NAME]
+    $PROG -a|--adopt [SESSION_NAME]
 
 DESCRIPTION
-    Starts (or re-attaches to) a tmux session running \`claude\` in
+    Starts (or re-attaches to) a tmux session running Claude Code in
     PROJECT_DIR. Re-running with the same SESSION_NAME re-attaches to
     the live session, so Claude Code keeps running across SSH
     disconnects and across devices (e.g. Mac desktop -> phone over
     Tailscale).
 
-    Remote Control (claude.ai/code visibility) is enabled after launch
-    by sending the \`/remote-control\` slash command into the claude
-    TUI — see "Post-launch Remote Control" below. If the browser-side
-    bridge becomes unresponsive (long sessions, sleep, network blips),
-    recover with --teleport. To enable RC on an already-running
-    cc-session-managed session, use --adopt.
+    Default launch runs \`claude remote-control\` — the dedicated
+    server subcommand that listens for sessions spawned from
+    claude.ai/code. The server prints its claude.ai/code URL on
+    startup; $PROG captures it from the pane and surfaces it via the
+    tmux status bar + a state file (see "Post-launch URL capture"
+    below). If the browser-side bridge becomes unresponsive (long
+    sessions, sleep, network blips), recover with --teleport.
+
+    --teleport uses a different path: it launches \`claude --teleport
+    <id>\` (an interactive resume of a specific cloud session) and
+    sends \`/remote-control\` as a slash command afterwards, because
+    the remote-control subcommand doesn't accept a teleport id.
 
 ARGUMENTS
     PROJECT_DIR     Directory to cd into before launching claude.
@@ -47,7 +56,7 @@ OPTIONS
                       below) and starts a fresh one running \`claude
                       --teleport <id>\`. Remote Control is then enabled
                       post-launch via the /remote-control slash command
-                      (see "Post-launch Remote Control"), producing a
+                      (see "Post-launch URL capture"), producing a
                       *new* claude.ai/code URL — the original ID-OR-URL
                       stays bound to its (now-dead) bridge.
 
@@ -57,10 +66,38 @@ OPTIONS
                         session_01EXAMPLEab...
                         01EXAMPLEab...
 
-    -c, --compact     After launching (or re-attaching), schedule a
-                      \`/compact\` keystroke to be sent into the claude
-                      pane after CC_SESSION_COMPACT_DELAY seconds (60s
-                      default).
+    -r, --resume UUID Resume a LOCAL on-disk session by its UUID and
+                      register a fresh Remote Control URL for it. Use
+                      this when you have only the local UUID (from
+                      \`~/.claude/projects/<proj>/<uuid>.jsonl\` or from
+                      \`claude --resume\` interactive picker) and not
+                      a cloud session_xxx — i.e., the cloud bridge
+                      orphan flow but starting from local state.
+
+                      Same first-turn token cost as --teleport --full
+                      (both load the entire transcript into context).
+                      Use over --teleport when:
+                        - The cloud session_xxx is lost (closed tab,
+                          private window history cleared)
+                        - You want zero cloud-bridge round-trip
+                        - You want to verify a session works locally
+                          before re-registering it remotely
+
+                      UUID is the canonical 8-4-4-4-12 hex form, e.g.
+                      \`d8fd4550-d9cc-4ebe-9336-c20b7408afb1\`. Different
+                      ID space from cloud session_xxx — don't mix.
+
+    -c, --compact     Once the post-launch URL is captured (i.e., once
+                      we know claude has reached an idle prompt), send
+                      a \`/compact\` keystroke into the pane. Requires
+                      --teleport or --resume, since default launches
+                      run the remote-control server which doesn't
+                      accept slash commands at its prompt.
+
+                      If URL capture fails, /compact is skipped (with
+                      a tmux display-message warning) — claude's state
+                      is unknown and the slash would land in arbitrary
+                      input.
 
     -f, --full        With --teleport, resume from the FULL transcript
                       instead of the default summary. This re-pays the
@@ -71,15 +108,32 @@ OPTIONS
                       CC_SESSION_SKIP_FULL_CONFIRM=1 to bypass when
                       scripting. Has no effect without --teleport.
 
-    -a, --adopt       Enable Remote Control on an already-running
-                      cc-session-managed tmux session and print the
-                      resulting claude.ai/code URL. Idempotent: if RC
-                      is already active, just prints the existing URL.
-                      Requires the session's claude TUI to be at an
-                      idle prompt (not mid-tool-call, not in a modal).
-                      Refuses to act on tmux sessions without the
-                      @cc-session-managed marker. Mutually exclusive
-                      with --teleport / --detach / --compact / --full.
+    -a, --adopt       Reclaim a session under cc-session control.
+                      The (single, optional) positional decides the
+                      mode automatically based on its shape:
+
+                      • Tmux session NAME (default 'claude'):
+                        Print the claude.ai/code URL for an
+                        already-running cc-session-managed tmux
+                        session. For server-mode sessions (default
+                        launches), the URL is already in the pane and
+                        is just captured. For interactive sessions
+                        (--teleport-launched) where RC isn't yet
+                        active, sends /remote-control to enable it.
+                        Idempotent. Refuses sessions without the
+                        @cc-session-managed marker. Requires claude
+                        to be at an idle prompt for the
+                        send-keystroke fallback.
+
+                      • Cloud session ID / URL (20+ char alphanumeric,
+                        session_-prefixed, or claude.ai/code URL):
+                        Auto-delegates to --teleport with default cwd
+                        and tmux session name. Use --teleport directly
+                        if you also want --full / --compact / a custom
+                        tmux name.
+
+                      Mutually exclusive with --teleport / --detach /
+                      --compact / --full when in tmux-name mode.
 
     -d, --detach      Start the session in the background and don't attach.
                       If the session already exists, this is a no-op
@@ -87,7 +141,17 @@ OPTIONS
                       recycles the session).
                       Re-attach later with: $PROG  (without -d).
     -l, --list        List existing tmux sessions and exit.
-    -k, --kill NAME   Kill the tmux session NAME and exit.
+    -k, --kill NAME   Kill the tmux session NAME and exit. Also removes
+                      the cached \`<NAME>.url\` state file so monitoring
+                      tools and browser bookmarks don't reconnect to a
+                      now-dead RC environment.
+    --status [NAME]   Print machine-parseable status for one or all
+                      managed sessions. Output is 5 lines per session:
+                      session, alive, managed, url, uptime_seconds.
+                      With no NAME, walks every tmux session carrying
+                      \`@cc-session-managed=1\`. Exit 0 iff at least one
+                      inspected session is alive. Safe to call from
+                      monitoring loops.
     -v, --version     Print version ($PROG $VERSION) and exit.
     -h, --help        Show this help and exit.
 
@@ -95,38 +159,56 @@ ENVIRONMENT
     CLAUDE_BIN                      Path to the claude binary.
                                     Auto-detected from
                                     \$HOME/.local/bin/claude, then \$PATH.
-    CC_SESSION_COMPACT_DELAY        Seconds to wait before sending
-                                    /compact with --compact. Default: 60.
+    CC_SESSION_RESUME_TIMEOUT       Seconds to wait for the
+                                    "Resume from summary" prompt after
+                                    --teleport before giving up.
+                                    Default: 15. Bump for slow networks
+                                    or large transcripts.
+    CC_SESSION_RC_URL_TIMEOUT       Seconds to wait for the RC URL to
+                                    surface in the pane (server-mode
+                                    default launch). Default: 15.
+    CC_SESSION_RC_ENABLE_TIMEOUT    Seconds to wait for the URL after
+                                    sending the /remote-control slash
+                                    command. Default: 10. Used in the
+                                    --teleport and --adopt paths.
     CC_SESSION_SKIP_FULL_CONFIRM    Set to 1 to skip the "type yes"
                                     confirmation that --full requires.
 
-POST-LAUNCH REMOTE CONTROL
+POST-LAUNCH URL CAPTURE
 
-    Background subshells (one per launch) handle two scripted
-    keystroke flows so the user lands on a session that's already
-    visible in claude.ai/code:
+    A background subshell (one per launch) waits for the
+    claude.ai/code URL to appear in the pane, then surfaces it.
 
-    1. Resume choice (--teleport only): Poll the pane every 0.5s for
-       up to ~15s, looking for "Resume from summary". When seen, send
-       "1" (summary, default) or "2" (--full).
+    Default launch (\`claude remote-control\`): the server prints its
+    URL ("https://claude.ai/code?environment=env_<id>") automatically
+    on startup. No keystrokes are sent — $PROG just polls the pane
+    for up to ~15s and captures the URL.
 
-    2. Remote Control enable (always): Once the pane no longer shows
-       a resume prompt — meaning claude is at an idle "❯" — send
-       "/remote-control" via tmux send-keys, then poll up to ~10s for
-       "/remote-control is active · Code in CLI or at <URL>". Idempotent
-       — if RC is already active, the pre-check finds the URL without
-       re-sending the keystroke.
+    --teleport launch: an extra two-step keystroke flow runs first,
+    because the interactive teleport TUI needs both a resume-choice
+    answer and the /remote-control slash command to register an RC
+    URL.
+
+        1. Resume choice: Poll the pane every 0.5s for up to ~15s,
+           looking for "Resume from summary". When seen, send "1"
+           (summary, default) or "2" (--full).
+        2. Remote Control enable: Once claude is back at an idle
+           prompt, send "/remote-control", then poll up to ~10s for
+           "/remote-control is active · Code in CLI or at <URL>".
+           Idempotent.
 
     The captured URL is written to:
         \${TMPDIR:-/tmp}/cc-session/<SESSION_NAME>.url
     and flashed in the tmux status bar via \`tmux display-message\`
     for 8 seconds so it's visible without grep.
 
-    Why a slash command, not a startup flag? \`claude --remote-control\`
-    paired with \`--teleport\` is silently ignored by the binary
-    ("--teleport sessions start without Remote Control. Use
-    /remote-control to enable it."). The slash-command path works
-    uniformly for both modes.
+    Why not the slash command for default launches too? The
+    \`claude\` interactive TUI creates an on-disk session immediately;
+    typing /remote-control then transitions away from that session,
+    leaving a permanently-orphaned JSONL under ~/.claude/projects/...
+    per launch. \`claude remote-control\` is a server subcommand with
+    no orphan session — one process, one URL, sessions spawned on
+    demand by claude.ai/code clients.
 
 EXAMPLES
     $PROG                              # ~/cc, session 'claude'
@@ -144,11 +226,9 @@ EXAMPLES
     $PROG -t session_01EXAMPLEabcdef1234567890         # same effect
     $PROG -t 01EXAMPLEabcdef1234567890                 # bare ID also OK
 
-    # Teleport + auto /compact 60s later (summary auto-picked first):
+    # Teleport + auto /compact (summary auto-picked first; /compact
+    # fires shortly after URL capture, no delay needed):
     $PROG -t session_01EXAMPLEabcdef1234567890 -c
-
-    # Custom /compact delay:
-    CC_SESSION_COMPACT_DELAY=120 $PROG -t session_xxx -c
 
     # Resume the FULL transcript (asks for 'yes' confirmation):
     $PROG -t session_xxx --full
@@ -208,6 +288,21 @@ EOF
 }
 
 # --- helpers -----------------------------------------------------------------
+# Validate an on-disk session UUID for `--resume`. claude stores
+# sessions at `~/.claude/projects/<project>/<uuid>.jsonl`; the uuid is
+# canonical 8-4-4-4-12 hex. Different ID space from cloud session_xxx.
+parse_resume_uuid() {
+  local raw="$1"
+  if [[ ! "$raw" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "$PROG: invalid UUID for --resume: $1" >&2
+    echo "       Expected canonical UUID format (e.g. d8fd4550-d9cc-4ebe-9336-c20b7408afb1)." >&2
+    echo "       This is a LOCAL session id (~/.claude/projects/<proj>/<uuid>.jsonl)," >&2
+    echo "       NOT the cloud session_xxx id; use --teleport for those." >&2
+    return 2
+  fi
+  printf '%s\n' "$raw"
+}
+
 # Normalise a Claude Code session reference into the canonical
 # `session_xxx` form. Accepts a full claude.ai/code URL, the bare
 # `session_xxx` ID, or just the suffix after `session_`.
@@ -224,32 +319,121 @@ parse_session_id() {
   printf '%s\n' "$raw"
 }
 
-# Pattern for Remote Control URLs surfaced in the claude TUI's
-# "/remote-control is active · Code in CLI or at <URL>" status line.
-RC_URL_REGEX='https://claude\.ai/code/session_[0-9A-Za-z]+'
+# State file path for the captured RC URL. Single writer (the post-launch
+# subshell), multiple readers (monitoring scripts, --status, hotkey tools).
+# Writes go through a tmpfile + atomic rename so a partial read can never
+# observe truncated content.
+state_file_for() {
+  local sess="$1"
+  printf '%s/cc-session/%s.url' "${TMPDIR:-/tmp}" "$sess"
+}
 
-# Scan a tmux session's pane for the active-RC status line. Empty
-# stdout means RC is not currently advertised in the visible scrollback.
+# Atomically write $2 to the state file for session $1. Caller is responsible
+# for ensuring the parent dir exists. Returns 0 on success, 1 if the rename
+# failed (e.g. read-only fs).
+write_state_url() {
+  local sess="$1" url="$2"
+  local target tmp state_dir
+  target="$(state_file_for "$sess")"
+  state_dir="$(dirname "$target")"
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+  tmp="$target.tmp.$$"
+  printf '%s\n' "$url" > "$tmp" 2>/dev/null || return 1
+  mv -f "$tmp" "$target" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+# Best-effort delete of the state file. Used by --kill so a stale URL
+# pointing at a now-dead env doesn't linger and mislead later readers.
+remove_state_url() {
+  local sess="$1"
+  rm -f "$(state_file_for "$sess")" 2>/dev/null || true
+}
+
+# Read the current state URL for $1, or empty if no state file.
+read_state_url() {
+  local f
+  f="$(state_file_for "$1")"
+  [[ -f "$f" ]] && cat "$f" 2>/dev/null || true
+}
+
+# Print human-readable + machine-parseable status for one or all
+# managed sessions. Used by --status; meant to be safe to call from
+# monitoring scripts on a tight loop.
 #
-# claude's real TUI wraps the line "/remote-control is active · Code
-# in CLI or at" onto two visible lines in narrow panes — not as a
-# tmux soft-wrap (which `-J` would join), but as two distinct logical
-# lines, with the URL on the second. We anchor on "is active" and use
-# grep -A1 to include the next line; the URL match wins on whichever
-# line it lands on. `tail -1` picks the most recent URL when several
-# toggles sit in the scrollback.
+# When called with a session name, output 5 lines:
+#   session: <name>
+#   alive: yes|no
+#   managed: yes|no
+#   url: <url-or-empty>
+#   uptime_seconds: <int-or-empty>
+# Exit 0 if alive, 1 if not.
+#
+# When called with no arg, prints the same block for every tmux
+# session that carries the @cc-session-managed marker. Exit 0 if any
+# managed session is alive, 1 otherwise.
+print_status_one() {
+  local sess="$1" alive=no managed=no url="" uptime=""
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    alive=yes
+    local marker
+    marker="$(tmux show-options -t "$sess" -v '@cc-session-managed' 2>/dev/null || true)"
+    [[ "$marker" == "1" ]] && managed=yes
+    url="$(read_state_url "$sess")"
+    # tmux session creation time as epoch -> uptime in seconds
+    local created_epoch now_epoch
+    created_epoch="$(tmux display-message -p -t "$sess" '#{session_created}' 2>/dev/null || true)"
+    if [[ -n "$created_epoch" ]]; then
+      now_epoch=$(date +%s)
+      uptime=$(( now_epoch - created_epoch ))
+    fi
+  else
+    # Even if tmux session is gone, a stale state file may exist.
+    url="$(read_state_url "$sess")"
+  fi
+  printf 'session: %s\n' "$sess"
+  printf 'alive: %s\n' "$alive"
+  printf 'managed: %s\n' "$managed"
+  printf 'url: %s\n' "$url"
+  printf 'uptime_seconds: %s\n' "$uptime"
+  [[ "$alive" == yes ]] && return 0 || return 1
+}
+
+print_status_all() {
+  local found_alive=0 first=1 sess
+  while IFS= read -r sess; do
+    [[ -z "$sess" ]] && continue
+    local marker
+    marker="$(tmux show-options -t "$sess" -v '@cc-session-managed' 2>/dev/null || true)"
+    [[ "$marker" != "1" ]] && continue
+    (( first )) || printf -- '---\n'
+    first=0
+    if print_status_one "$sess"; then
+      found_alive=1
+    fi
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+  if (( first )); then
+    echo "no managed sessions" >&2
+    return 1
+  fi
+  return $(( found_alive ? 0 : 1 ))
+}
+
+# Pattern for Remote Control URLs surfaced in claude's TUI. Two shapes
+# appear in the wild:
+#   1. Server mode (claude remote-control):
+#      "Continue coding in the Claude app or https://claude.ai/code?environment=env_<id>"
+#   2. Session mode (claude --teleport <id> + /remote-control slash):
+#      "/remote-control is active · Code in CLI or at https://claude.ai/code/session_<id>"
+RC_URL_REGEX='https://claude\.ai/code(\?environment=env_[0-9A-Za-z]+|/session_[0-9A-Za-z]+)'
+
+# Scan a tmux session's pane for an RC URL. Empty stdout means no URL
+# is currently advertised in the visible scrollback. -J joins tmux's
+# soft-wrap so URLs that span the visual width are still matchable;
+# tail -1 picks the most recent when multiple toggles sit in the
+# scrollback (e.g. an --adopt after a stale URL).
 get_active_rc_url() {
   local sess="$1"
-  # Two patterns the TUI surfaces an active RC URL under:
-  #   1. "/remote-control is active · Code in CLI or at <URL>"
-  #      — printed once when RC is enabled.
-  #   2. "This session is available via Remote Control at\n<URL>"
-  #      — the management menu shown if /remote-control is invoked
-  #      while RC is already active. Detecting this pattern lets the
-  #      pre-check find a URL without opening the menu (which would
-  #      then need an Esc to dismiss).
   tmux capture-pane -t "$sess" -p -S -200 -J 2>/dev/null \
-    | grep -A1 -E '(is active|available via Remote Control)' \
     | grep -oE "$RC_URL_REGEX" \
     | tail -1 \
     || true
@@ -258,17 +442,20 @@ get_active_rc_url() {
 # Enable Remote Control on a tmux session whose first pane runs claude
 # at an idle prompt. Idempotent: if RC is already active, just returns
 # the current URL. Otherwise sends "/remote-control" via tmux send-keys
-# and polls the pane for up to ~10s waiting for the URL to appear.
-# Echoes the URL on stdout. Returns 1 if no URL surfaces.
+# and polls the pane for up to CC_SESSION_RC_ENABLE_TIMEOUT seconds
+# (default 10) waiting for the URL to appear. Echoes the URL on stdout.
+# Returns 1 if no URL surfaces in time.
 enable_remote_control() {
-  local sess="$1" url _i
+  local sess="$1" url _i timeout iters
   url="$(get_active_rc_url "$sess")"
   if [[ -n "$url" ]]; then
     printf '%s\n' "$url"
     return 0
   fi
   tmux send-keys -t "$sess" "/remote-control" Enter 2>/dev/null || return 1
-  for _i in {1..20}; do
+  timeout="${CC_SESSION_RC_ENABLE_TIMEOUT:-10}"
+  iters=$(( timeout * 2 ))  # 0.5s polling interval
+  for (( _i=0; _i<iters; _i++ )); do
     sleep 0.5
     url="$(get_active_rc_url "$sess")"
     if [[ -n "$url" ]]; then
@@ -292,6 +479,7 @@ enable_remote_control() {
 # --- arg parsing -------------------------------------------------------------
 DETACH=0
 TELEPORT_ID=""
+RESUME_UUID=""
 RUN_COMPACT=0
 RESUME_FULL=0
 ADOPT=0
@@ -303,14 +491,40 @@ while (( $# )); do
       printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
     -l|--list)
       exec tmux list-sessions ;;
+    --status)
+      # --status [SESSION_NAME]
+      # Prints 5-line block (session/alive/managed/url/uptime_seconds)
+      # per session. With no arg: every managed session. Exit 0 iff at
+      # least one inspected session is alive.
+      shift
+      if [[ -n "${1:-}" ]]; then
+        print_status_one "$1"
+        exit $?
+      else
+        print_status_all
+        exit $?
+      fi ;;
     -k|--kill)
       [[ -z "${2:-}" ]] && { echo "$PROG: --kill requires a session name" >&2; exit 2; }
-      exec tmux kill-session -t "$2" ;;
+      # Clean state file alongside the tmux session — a stale .url
+      # pointing at a now-dead env confuses monitoring scripts and
+      # browser bookmarks. Kill the tmux session first; if it didn't
+      # exist, still wipe the state file (best-effort).
+      # `|| kill_exit=$?` both captures the exit code AND keeps `set -e`
+      # from terminating the script on a missing tmux session.
+      kill_exit=0
+      tmux kill-session -t "$2" 2>/dev/null || kill_exit=$?
+      remove_state_url "$2"
+      exit "$kill_exit" ;;
     -d|--detach)
       DETACH=1; shift ;;
     -t|--teleport)
       [[ -z "${2:-}" ]] && { echo "$PROG: --teleport requires a session id or URL" >&2; exit 2; }
       TELEPORT_ID="$(parse_session_id "$2")" || exit $?
+      shift 2 ;;
+    -r|--resume)
+      [[ -z "${2:-}" ]] && { echo "$PROG: --resume requires a local session UUID" >&2; exit 2; }
+      RESUME_UUID="$(parse_resume_uuid "$2")" || exit $?
       shift 2 ;;
     -c|--compact)
       RUN_COMPACT=1; shift ;;
@@ -329,24 +543,66 @@ while (( $# )); do
   esac
 done
 
+# --teleport / --resume mutually exclusive — both spawn an interactive
+# claude in the same tmux pane; you can't do both.
+if [[ -n "$TELEPORT_ID" ]] && [[ -n "$RESUME_UUID" ]]; then
+  echo "$PROG: --teleport and --resume are mutually exclusive" >&2
+  exit 2
+fi
+
 # --full only makes sense with --teleport (it picks the post-teleport
-# resume option). Refuse silent no-ops.
+# resume option). --resume always loads the full local transcript and
+# has no summary/full prompt to answer. Refuse silent no-ops.
 if (( RESUME_FULL )) && [[ -z "$TELEPORT_ID" ]]; then
   echo "$PROG: --full requires --teleport" >&2
   exit 2
 fi
 
-# --adopt operates on an existing managed tmux session — incompatible
-# with launch flags that spawn / recycle a new process.
-if (( ADOPT )); then
-  if [[ -n "$TELEPORT_ID" ]]; then
-    echo "$PROG: --adopt and --teleport are mutually exclusive" >&2
-    exit 2
-  fi
-  if (( DETACH || RUN_COMPACT || RESUME_FULL )); then
-    echo "$PROG: --adopt is incompatible with --detach / --compact / --full" >&2
-    exit 2
-  fi
+# --compact sends /compact into the pane after URL capture; that only
+# does anything useful for an interactive claude TUI, which we only
+# have on the --teleport / --resume paths. Default launches run
+# `claude remote-control` (a server, not an interactive prompt),
+# where typed slash commands wouldn't be parsed. Refuse silent no-ops.
+if (( RUN_COMPACT )) && [[ -z "$TELEPORT_ID" ]] && [[ -z "$RESUME_UUID" ]]; then
+  echo "$PROG: --compact requires --teleport or --resume" >&2
+  echo "       (default launches run \`claude remote-control\`, which" >&2
+  echo "        doesn't accept slash commands at its prompt.)" >&2
+  exit 2
+fi
+
+# --full + --compact would be self-defeating: --full opts into paying
+# the full transcript token cost specifically because the user wants
+# the complete context loaded; --compact would immediately summarize
+# that just-loaded full transcript. Net effect: pay for full load
+# AND for the compact pass, end up roughly at summary-mode size —
+# strictly worse than dropping --full.
+#
+# Other --compact combos remain valid:
+#   --teleport (summary) + --compact: small summary -> tighter context
+#   --resume + --compact: --resume has no summary option, so compacting
+#                         after the forced-full load is the legit
+#                         context-cleanup path
+if (( RESUME_FULL )) && (( RUN_COMPACT )); then
+  echo "$PROG: --full and --compact don't combine sensibly:" >&2
+  echo "       --full opts into the full transcript token cost; --compact" >&2
+  echo "       would immediately summarize it, defeating --full's purpose." >&2
+  echo "       Either drop --full (use teleport's default summary mode)" >&2
+  echo "       or drop --compact (keep the full transcript in context)." >&2
+  exit 2
+fi
+
+# --adopt incompatible with --teleport / --resume — pick one entry point.
+# (--detach / --compact / --full vs --adopt are checked later inside the
+#  --adopt block, conditionally on which mode the arg shape lands in:
+#  tmux-name mode rejects them; cloud-id mode auto-delegates to teleport
+#  which uses those flags normally.)
+if (( ADOPT )) && [[ -n "$TELEPORT_ID" ]]; then
+  echo "$PROG: --adopt and --teleport are mutually exclusive" >&2
+  exit 2
+fi
+if (( ADOPT )) && [[ -n "$RESUME_UUID" ]]; then
+  echo "$PROG: --adopt and --resume are mutually exclusive" >&2
+  exit 2
 fi
 
 # Confirm --full because it can re-pay the entire conversation's tokens.
@@ -381,28 +637,75 @@ fi
 # Short-circuits before launch validation: doesn't need PROJECT_DIR or
 # CLAUDE_BIN, just an existing cc-session-managed tmux session whose
 # claude TUI is at idle.
+#
+# Positional handling differs from the launch path: --adopt takes at
+# most one positional, the tmux SESSION_NAME (default 'claude').
+# PROJECT_DIR is meaningless here. The bug this guards: with the
+# launch-style "[PROJECT_DIR] [SESSION_NAME]" convention, a user who
+# typed \`cc-session --adopt <some-id>\` would silently get the first
+# arg parsed as PROJECT_DIR and SESSION_NAME defaulted to 'claude' —
+# adopting whatever tmux session happened to be named 'claude'.
 if (( ADOPT )); then
-  if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-    echo "$PROG: tmux session '$SESSION_NAME' does not exist (nothing to adopt)" >&2
+  adopt_arg="${1:-}"
+  # Heuristic: a 20+ char pure-alphanumeric (ULID-shape) value, or
+  # one prefixed with "session_" / starting with the claude.ai URL,
+  # is overwhelmingly a cloud session ID the user copied from a
+  # browser. Auto-delegate to the --teleport launch path so
+  # `cc-session --adopt session_xxx` Just Works for orphaned cloud
+  # sessions — no need to remember the --teleport / --adopt split.
+  if [[ -n "$adopt_arg" ]] && { [[ "$adopt_arg" =~ ^[0-9A-Za-z]{20,}$ ]] \
+       || [[ "$adopt_arg" == session_* ]] \
+       || [[ "$adopt_arg" == https://*claude.ai/code/* ]]; }; then
+    if [[ -n "${4:-}" ]]; then
+      echo "$PROG: --adopt with cloud id takes at most 3 positionals: <cloud-id> [PROJECT_DIR] [SESSION_NAME]" >&2
+      exit 2
+    fi
+    TELEPORT_ID="$(parse_session_id "$adopt_arg")" || exit $?
+    # Re-bind PROJECT_DIR and SESSION_NAME from positionals 2/3
+    # (positional 1 was the cloud-id; the early "${1:-$HOME/cc}"
+    #  binding put the cloud id into PROJECT_DIR, which we don't want).
+    PROJECT_DIR="${2:-$HOME/cc}"
+    SESSION_NAME="${3:-claude}"
+    echo "$PROG: '$adopt_arg' looks like a cloud session id — switching to --teleport mode" >&2
+    echo "       (target tmux session: '$SESSION_NAME', cwd: '$PROJECT_DIR')" >&2
+    ADOPT=0  # fall through to the --teleport launch path below
+  else
+    if [[ -n "${2:-}" ]]; then
+      echo "$PROG: --adopt (tmux-name mode) takes at most one positional; got 2" >&2
+      echo "       Usage: $PROG --adopt [SESSION_NAME]" >&2
+      echo "       (For cloud-session reclaim, pass a session_xxx id or URL instead.)" >&2
+      exit 2
+    fi
+    # tmux-name mode: --detach / --compact / --full make no sense
+    # because we're not launching anything. Reject explicitly so a
+    # `cc-session --adopt -d` typo doesn't silently miss the intent.
+    if (( DETACH || RUN_COMPACT || RESUME_FULL )); then
+      echo "$PROG: --adopt (tmux-name mode) is incompatible with --detach / --compact / --full" >&2
+      echo "       (those flags only apply when --adopt's arg is a cloud session id, which auto-delegates to --teleport.)" >&2
+      exit 2
+    fi
+    SESSION_NAME="${adopt_arg:-claude}"
+    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+      echo "$PROG: tmux session '$SESSION_NAME' does not exist (nothing to adopt)" >&2
+      exit 1
+    fi
+    managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
+    if [[ "$managed" != "1" ]]; then
+      echo "$PROG: refusing to adopt unmanaged tmux session '$SESSION_NAME' (no @cc-session-managed marker)" >&2
+      echo "       cc-session only acts on sessions it created. To bring an" >&2
+      echo "       outside session under management, kill + relaunch it via" >&2
+      echo "         tmux kill-session -t $SESSION_NAME && $PROG ... $SESSION_NAME" >&2
+      exit 1
+    fi
+    if url="$(enable_remote_control "$SESSION_NAME")"; then
+      echo "$PROG: Remote Control on '$SESSION_NAME': $url"
+      write_state_url "$SESSION_NAME" "$url" || true
+      exit 0
+    fi
+    echo "$PROG: failed to enable Remote Control on '$SESSION_NAME' within 10s" >&2
+    echo "       Is claude at an idle prompt? Check: tmux attach -t $SESSION_NAME" >&2
     exit 1
   fi
-  managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
-  if [[ "$managed" != "1" ]]; then
-    echo "$PROG: refusing to adopt unmanaged tmux session '$SESSION_NAME' (no @cc-session-managed marker)" >&2
-    echo "       cc-session only acts on sessions it created. To bring an" >&2
-    echo "       outside session under management, kill + relaunch it via" >&2
-    echo "         tmux kill-session -t $SESSION_NAME && $PROG ... $SESSION_NAME" >&2
-    exit 1
-  fi
-  if url="$(enable_remote_control "$SESSION_NAME")"; then
-    echo "$PROG: Remote Control on '$SESSION_NAME': $url"
-    mkdir -p "${TMPDIR:-/tmp}/cc-session" 2>/dev/null && \
-      printf '%s\n' "$url" > "${TMPDIR:-/tmp}/cc-session/$SESSION_NAME.url" 2>/dev/null || true
-    exit 0
-  fi
-  echo "$PROG: failed to enable Remote Control on '$SESSION_NAME' within 10s" >&2
-  echo "       Is claude at an idle prompt? Check: tmux attach -t $SESSION_NAME" >&2
-  exit 1
 fi
 
 if [[ ! -d "$PROJECT_DIR" ]]; then
@@ -419,20 +722,34 @@ if [[ -z "${CLAUDE_BIN:-}" ]]; then
   exit 1
 fi
 
-# Build claude argv. We deliberately do NOT pass --remote-control as a
-# startup flag: when combined with --teleport, claude's binary silently
-# ignores it ("--teleport sessions start without Remote Control. Use
-# /remote-control to enable it."), and the slash-command path works
-# uniformly for both --teleport and the default launch. RC is enabled
-# below via tmux send-keys after the TUI reaches an idle prompt.
+# Build claude argv. Two launch paths:
+#
+#   - Default launch: `claude remote-control` — the dedicated subcommand
+#     that runs as a persistent multi-session server in PROJECT_DIR. It
+#     prints its claude.ai/code URL on startup with no further keystrokes
+#     needed, so the post-launch subshell just polls the pane for the
+#     URL. This replaces the previous "spawn interactive claude, then
+#     send /remote-control via tmux send-keys" approach, which left one
+#     orphan on-disk session per launch (the TUI's original session was
+#     abandoned at the moment /remote-control transitioned it away).
+#
+#   - --teleport: `claude --teleport <id>` (interactive) + the
+#     /remote-control slash command, because the remote-control
+#     subcommand doesn't accept a teleport id — teleport always resumes
+#     a specific cloud session in the interactive TUI, and RC is then
+#     enabled on top of it via the slash command.
 CLAUDE_ARGS=()
-if [[ -n "$TELEPORT_ID" ]]; then
-  CLAUDE_ARGS+=(--teleport "$TELEPORT_ID")
-  # --teleport recycles the tmux session — but only if cc-session
-  # created it. We mark managed sessions with the @cc-session-managed
-  # tmux user option (set after new-session below); refuse to kill
-  # anything without that marker so we don't clobber a same-named
-  # session the user set up by hand.
+if [[ -n "$TELEPORT_ID" ]] || [[ -n "$RESUME_UUID" ]]; then
+  if [[ -n "$TELEPORT_ID" ]]; then
+    CLAUDE_ARGS+=(--teleport "$TELEPORT_ID")
+  else
+    CLAUDE_ARGS+=(--resume "$RESUME_UUID")
+  fi
+  # --teleport / --resume both recycle the tmux session — but only if
+  # cc-session created it. We mark managed sessions with the
+  # @cc-session-managed tmux user option (set after new-session below);
+  # refuse to kill anything without that marker so we don't clobber a
+  # same-named session the user set up by hand.
   if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
     if [[ "$managed" != "1" ]]; then
@@ -444,7 +761,13 @@ if [[ -n "$TELEPORT_ID" ]]; then
       exit 1
     fi
     tmux kill-session -t "$SESSION_NAME"
+    # Wipe the now-stale state file too — same hygiene as --kill.
+    remove_state_url "$SESSION_NAME"
   fi
+else
+  # Default launch: server-mode RC. Append the subcommand here so the
+  # tmux pane runs `claude remote-control`.
+  CLAUDE_ARGS+=(remote-control)
 fi
 
 if [[ -n "$TELEPORT_ID" ]]; then
@@ -466,45 +789,100 @@ if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   created=1
 fi
 
-# Schedule the post-launch keystroke flow in a backgrounded subshell
+# Schedule the post-launch URL-capture flow in a backgrounded subshell
 # that survives `exec tmux attach`. Started AFTER `tmux new-session`
 # so we never race the session into existence — early `tmux send-keys`
 # against a not-yet-created session would silently no-op.
 #
 #   1. (--teleport only) Poll for "Resume from summary" prompt up to
-#      ~15s, then send "1" (summary, default) or "2" (--full).
-#   2. Poll for the active-RC marker; if absent, send "/remote-control"
-#      and wait up to ~10s for it to surface. Capture the URL into
+#      ~15s, then send "1" (summary, default) or "2" (--full). Then
+#      send "/remote-control" once the TUI reaches an idle prompt;
+#      this is the teleport-only step because `claude remote-control`
+#      doesn't accept a teleport id, so we still bridge the interactive
+#      TUI to claude.ai/code via the slash command.
+#   2. (always) Poll the pane for the claude.ai/code URL. In server
+#      mode the URL is printed automatically on startup; in teleport
+#      mode it arrives after the slash command above. Capture into
 #      $TMPDIR/cc-session/<SESSION>.url and flash it via tmux
 #      display-message so the URL is visible without grepping.
 (
+  resume_timeout="${CC_SESSION_RESUME_TIMEOUT:-15}"
+  url_timeout="${CC_SESSION_RC_URL_TIMEOUT:-15}"
+
   if [[ -n "$TELEPORT_ID" ]]; then
-    for _i in {1..30}; do
+    # Teleport: wait for "Resume from summary" prompt, send 1 or 2.
+    resume_iters=$(( resume_timeout * 2 ))
+    resume_sent=0
+    for (( _i=0; _i<resume_iters; _i++ )); do
       if tmux capture-pane -t "$SESSION_NAME" -p 2>/dev/null \
            | grep -q 'Resume from summary'; then
         tmux send-keys -t "$SESSION_NAME" "$RESUME_KEY" Enter
+        resume_sent=1
         break
       fi
       sleep 0.5
     done
+    if (( ! resume_sent )); then
+      tmux display-message -t "$SESSION_NAME" -d 12000 \
+        "$PROG: WARN — resume prompt not seen in ${resume_timeout}s; bump CC_SESSION_RESUME_TIMEOUT" \
+        2>/dev/null || true
+    fi
     sleep 2  # give resume choice a moment to settle into idle prompt
+    url="$(enable_remote_control "$SESSION_NAME")" || url=""
+  elif [[ -n "$RESUME_UUID" ]]; then
+    # Local resume: claude --resume loads on-disk transcript directly.
+    # No "Resume from summary" prompt here (that's a teleport-only
+    # cloud-side question), but we still need /remote-control to
+    # surface a fresh RC URL since claude --resume has no native RC
+    # registration.
+    sleep 2  # give claude time to open the JSONL and reach idle
+    url="$(enable_remote_control "$SESSION_NAME")" || url=""
+  else
+    # Server-mode launch: just poll for the URL the server prints on
+    # startup. No keystrokes needed.
+    url=""
+    url_iters=$(( url_timeout * 2 ))
+    for (( _i=0; _i<url_iters; _i++ )); do
+      url="$(get_active_rc_url "$SESSION_NAME")"
+      [[ -n "$url" ]] && break
+      sleep 0.5
+    done
   fi
-  if url="$(enable_remote_control "$SESSION_NAME")"; then
-    state_dir="${TMPDIR:-/tmp}/cc-session"
-    mkdir -p "$state_dir" 2>/dev/null && \
-      printf '%s\n' "$url" > "$state_dir/$SESSION_NAME.url" 2>/dev/null
+  if [[ -n "$url" ]]; then
+    write_state_url "$SESSION_NAME" "$url" || true
     tmux display-message -t "$SESSION_NAME" -d 8000 \
       "$PROG: Remote Control: $url" 2>/dev/null || true
+
+    # /compact lands here, immediately after URL capture. Successful
+    # URL capture in the teleport / resume path means /remote-control
+    # returned (URL appeared in pane), which means claude processed
+    # the slash command and is back at idle prompt. send-keys queues
+    # /compact into the PTY; claude's input event loop processes it
+    # in order, so even if a sub-second TUI redraw is mid-flight the
+    # bytes get buffered and parsed as a slash command. No artificial
+    # grace period needed.
+    if (( RUN_COMPACT )); then
+      tmux send-keys -t "$SESSION_NAME" "/compact" Enter 2>/dev/null || true
+    fi
+  else
+    # Either teleport's /remote-control didn't surface a URL, or the
+    # server never printed one. Surface a hint so the user — who
+    # likely ran with --detach and won't see this in the foreground —
+    # discovers it on next attach instead of silently getting no URL.
+    tmux display-message -t "$SESSION_NAME" -d 12000 \
+      "$PROG: WARN — no RC URL captured in ${url_timeout}s; check pane manually or bump CC_SESSION_RC_URL_TIMEOUT" \
+      2>/dev/null || true
+    # If /compact was requested but URL never came up, don't fire it
+    # — claude is in some unknown state and the slash command would
+    # land in arbitrary input. Surface a separate warning so the user
+    # knows compact didn't run.
+    if (( RUN_COMPACT )); then
+      tmux display-message -t "$SESSION_NAME" -d 12000 \
+        "$PROG: WARN — /compact skipped (URL never captured; claude not at known idle)" \
+        2>/dev/null || true
+    fi
   fi
 ) >/dev/null 2>&1 &
-
-# Schedule /compact after a delay so it lands once the resume / teleport
-# prompt is past. Runs in a detached subshell that survives `exec tmux`.
-if (( RUN_COMPACT )); then
-  ( sleep "${CC_SESSION_COMPACT_DELAY:-60}" \
-    && tmux send-keys -t "$SESSION_NAME" "/compact" Enter ) \
-    >/dev/null 2>&1 &
-fi
 
 if (( DETACH )); then
   if [[ -n "$created" ]]; then

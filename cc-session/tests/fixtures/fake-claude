@@ -1,25 +1,59 @@
 #!/bin/sh
 # Stub claude CLI for cc-session bats tests. Prints invoked argv (so
 # tests can assert on argument forwarding), then drives a tiny mock TUI
-# so the post-launch keystroke flow has something observable:
+# so the post-launch flow has something observable. The stub now covers
+# the two launch shapes cc-session uses:
 #
-#   - With "--teleport <id>" in argv, prints a fake "Session resumed /
-#     Resume from summary" prompt so cc-session's resume-key poll
-#     fires within ms.
-#   - Reads stdin line-by-line and emits canned responses for the
-#     resume keys "1" / "2", "/remote-control", and "/compact" — these
-#     are the keystrokes cc-session itself sends.
+#   - `fake-claude remote-control` (default launch in cc-session >= 0.3.0):
+#     Print a synthetic "server connected · URL" header on startup, using
+#     the ?environment=env_FAKE<pid> shape so each test sees a unique
+#     URL. cc-session's post-launch poll then captures it from the pane
+#     with no keystrokes sent.
 #
-# The "is active · Code in CLI or at https://..." line uses session_FAKE
-# + the stub's PID so each test sees a unique synthetic URL.
+#   - `fake-claude --teleport <id>` (--teleport path): Print a fake
+#     "Session resumed / Resume from summary" prompt so cc-session's
+#     resume-key poll fires within ms. Then the stdin loop responds to
+#     resume keys "1" / "2", "/remote-control" (emits a session_FAKE
+#     URL on the legacy "is active · Code in CLI or at" line), and
+#     "/compact".
+#
+#   - `fake-claude --resume <uuid>` (--resume path): Print a fake
+#     "Session resumed" banner without the summary/full prompt
+#     (claude --resume loads on-disk transcript directly), then drop
+#     into the stdin loop so /remote-control + /compact still work.
+#
+#   - `fake-claude` with no args: legacy interactive mode used by older
+#     --adopt tests that pre-create a managed session by hand. Same
+#     stdin loop, just no startup banner.
 
 echo "fake claude args: $*"
 
 case " $* " in
+  *' remote-control '*)
+    # Server-mode banner — URL on its own line, matching the real
+    # `claude remote-control` startup screen ("Continue coding in the
+    # Claude app or <URL>").
+    printf '\n·OK· Connected · fake · HEAD\n'
+    printf '    Capacity: 1/32 · New sessions will be created in the current directory\n'
+    printf '\nContinue coding in the Claude app or https://claude.ai/code?environment=env_FAKE%05d\n' "$$"
+    # Block so the tmux pane doesn't exit and break tests that
+    # capture-pane later. Echo received lines back as
+    # "server stdin: <line>" so tests can detect any unexpected
+    # keystroke (e.g. a buggy /remote-control sent into server mode).
+    while IFS= read -r line; do
+      printf 'server stdin: %s\n' "$line"
+    done
+    exit 0
+    ;;
   *' --teleport '*)
     printf '\nSession resumed\n'
     printf '  Resume from summary (recommended)\n'
     printf '  Resume full session as-is\n'
+    ;;
+  *' --resume '*)
+    # Local resume: no "Resume from summary" prompt (that's teleport-
+    # only). Just print a banner and drop into the stdin loop.
+    printf '\nSession resumed from on-disk transcript\n'
     ;;
 esac
 
