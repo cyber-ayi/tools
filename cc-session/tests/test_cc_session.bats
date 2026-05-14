@@ -437,6 +437,25 @@ marker_value() {
   refute_contains "$pane" "/remote-control is active"
 }
 
+@test "/compact fires AFTER URL capture, not on a fixed delay" {
+  # Use a short compact delay so the test doesn't wait long.
+  CC_SESSION_COMPACT_DELAY=1 run "$CC_SESSION" -d -t session_TEST --compact "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  # First the URL must be captured (proving claude reached idle).
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -f "$state_file" ] && break
+    sleep 0.5
+  done
+  [ -f "$state_file" ]
+  # THEN /compact lands. fake-claude echoes "fake: /compact received"
+  # when it reads /compact on stdin.
+  wait_for_pane "$SESSION_NAME" "fake: /compact received" 30 \
+    || { echo "fake-claude never received /compact"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; \
+         return 1; }
+}
+
 @test "background flow sends resume key 1 (summary) when --teleport given" {
   run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0

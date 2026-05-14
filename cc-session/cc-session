@@ -65,12 +65,18 @@ OPTIONS
                         session_01EXAMPLEab...
                         01EXAMPLEab...
 
-    -c, --compact     After launching (or re-attaching), schedule a
-                      \`/compact\` keystroke to be sent into the claude
-                      pane after CC_SESSION_COMPACT_DELAY seconds (60s
-                      default). Requires --teleport, since default
-                      launches run the remote-control server which
-                      doesn't accept slash commands at its prompt.
+    -c, --compact     After the post-launch URL is captured (i.e., once
+                      we know claude has reached an idle prompt), wait
+                      CC_SESSION_COMPACT_DELAY seconds (default 5) and
+                      send a \`/compact\` keystroke into the pane.
+                      Requires --teleport, since default launches run
+                      the remote-control server which doesn't accept
+                      slash commands at its prompt.
+
+                      If URL capture fails, /compact is skipped (with
+                      a tmux display-message warning) — claude's state
+                      is unknown and the slash would land in arbitrary
+                      input.
 
     -f, --full        With --teleport, resume from the FULL transcript
                       instead of the default summary. This re-pays the
@@ -132,8 +138,14 @@ ENVIRONMENT
     CLAUDE_BIN                      Path to the claude binary.
                                     Auto-detected from
                                     \$HOME/.local/bin/claude, then \$PATH.
-    CC_SESSION_COMPACT_DELAY        Seconds to wait before sending
-                                    /compact with --compact. Default: 60.
+    CC_SESSION_COMPACT_DELAY        Seconds to wait AFTER the RC URL
+                                    is captured (i.e., after claude
+                                    reaches idle prompt) before sending
+                                    /compact with --compact. Default: 5.
+                                    Pre-0.4 the default was 60s because
+                                    we couldn't detect idle and used a
+                                    fixed delay — now the delay is just
+                                    a small grace period.
     CC_SESSION_RESUME_TIMEOUT       Seconds to wait for the
                                     "Resume from summary" prompt after
                                     --teleport before giving up.
@@ -761,6 +773,20 @@ fi
     write_state_url "$SESSION_NAME" "$url" || true
     tmux display-message -t "$SESSION_NAME" -d 8000 \
       "$PROG: Remote Control: $url" 2>/dev/null || true
+
+    # /compact lands here, AFTER URL capture. Successful URL capture
+    # in the teleport path means /remote-control returned, which means
+    # claude is at idle prompt — so /compact will be parsed instead
+    # of dropped on the floor. The small grace (default 5s) just lets
+    # any final UI animation settle.
+    #
+    # CC_SESSION_COMPACT_DELAY remains an env var for back-compat (old
+    # default was 60s, reflecting a fixed-delay world where we couldn't
+    # detect idle). Now that we KNOW idle, 5s is plenty.
+    if (( RUN_COMPACT )); then
+      sleep "${CC_SESSION_COMPACT_DELAY:-5}"
+      tmux send-keys -t "$SESSION_NAME" "/compact" Enter 2>/dev/null || true
+    fi
   else
     # Either teleport's /remote-control didn't surface a URL, or the
     # server never printed one. Surface a hint so the user — who
@@ -769,16 +795,17 @@ fi
     tmux display-message -t "$SESSION_NAME" -d 12000 \
       "$PROG: WARN — no RC URL captured in ${url_timeout}s; check pane manually or bump CC_SESSION_RC_URL_TIMEOUT" \
       2>/dev/null || true
+    # If /compact was requested but URL never came up, don't fire it
+    # — claude is in some unknown state and the slash command would
+    # land in arbitrary input. Surface a separate warning so the user
+    # knows compact didn't run.
+    if (( RUN_COMPACT )); then
+      tmux display-message -t "$SESSION_NAME" -d 12000 \
+        "$PROG: WARN — /compact skipped (URL never captured; claude not at known idle)" \
+        2>/dev/null || true
+    fi
   fi
 ) >/dev/null 2>&1 &
-
-# Schedule /compact after a delay so it lands once the resume / teleport
-# prompt is past. Runs in a detached subshell that survives `exec tmux`.
-if (( RUN_COMPACT )); then
-  ( sleep "${CC_SESSION_COMPACT_DELAY:-60}" \
-    && tmux send-keys -t "$SESSION_NAME" "/compact" Enter ) \
-    >/dev/null 2>&1 &
-fi
 
 if (( DETACH )); then
   if [[ -n "$created" ]]; then
