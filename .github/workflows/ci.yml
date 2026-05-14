@@ -153,11 +153,15 @@ jobs:
           python -c "import xml.etree.ElementTree as ET; r=ET.parse('coverage.xml').getroot(); print(f'Line: {float(r.get(\"line-rate\",0))*100:.1f}%  Branch: {float(r.get(\"branch-rate\",0))*100:.1f}%')" >> "$GITHUB_STEP_SUMMARY"
 
   cc-session:
-    name: cc-session (bats)
+    name: cc-session (bats / ${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.cc-session == 'true' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: cc-session
@@ -165,10 +169,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install zsh, tmux, bats
+      - name: Install zsh, tmux, bats (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends zsh tmux bats
+      - name: Install tmux, bats (macOS — zsh ships with the OS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install tmux bats-core
+      - name: Verify versions
+        run: |
           zsh --version
           tmux -V
           bats --version
