@@ -558,15 +558,36 @@ if (( RESUME_FULL )) && [[ -z "$TELEPORT_ID" ]]; then
   exit 2
 fi
 
-# --compact sends /compact into the pane after a delay; that only does
-# anything useful for an interactive claude TUI, which we only have on
-# the --teleport / --resume paths. Default launches run `claude remote-
-# control` (a server, not an interactive prompt), where typed slash
-# commands wouldn't be parsed. Refuse silent no-ops.
+# --compact sends /compact into the pane after URL capture; that only
+# does anything useful for an interactive claude TUI, which we only
+# have on the --teleport / --resume paths. Default launches run
+# `claude remote-control` (a server, not an interactive prompt),
+# where typed slash commands wouldn't be parsed. Refuse silent no-ops.
 if (( RUN_COMPACT )) && [[ -z "$TELEPORT_ID" ]] && [[ -z "$RESUME_UUID" ]]; then
   echo "$PROG: --compact requires --teleport or --resume" >&2
   echo "       (default launches run \`claude remote-control\`, which" >&2
   echo "        doesn't accept slash commands at its prompt.)" >&2
+  exit 2
+fi
+
+# --full + --compact would be self-defeating: --full opts into paying
+# the full transcript token cost specifically because the user wants
+# the complete context loaded; --compact would immediately summarize
+# that just-loaded full transcript. Net effect: pay for full load
+# AND for the compact pass, end up roughly at summary-mode size —
+# strictly worse than dropping --full.
+#
+# Other --compact combos remain valid:
+#   --teleport (summary) + --compact: small summary -> tighter context
+#   --resume + --compact: --resume has no summary option, so compacting
+#                         after the forced-full load is the legit
+#                         context-cleanup path
+if (( RESUME_FULL )) && (( RUN_COMPACT )); then
+  echo "$PROG: --full and --compact don't combine sensibly:" >&2
+  echo "       --full opts into the full transcript token cost; --compact" >&2
+  echo "       would immediately summarize it, defeating --full's purpose." >&2
+  echo "       Either drop --full (use teleport's default summary mode)" >&2
+  echo "       or drop --compact (keep the full transcript in context)." >&2
   exit 2
 fi
 

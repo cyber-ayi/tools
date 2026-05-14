@@ -427,6 +427,17 @@ marker_value() {
   assert_contains "$output" -- "--compact requires --teleport"
 }
 
+@test "--full + --compact rejected as self-defeating" {
+  # Self-defeating: --full pays for full transcript load, --compact
+  # immediately summarizes it. Strictly worse than just --teleport
+  # (default summary mode).
+  CC_SESSION_SKIP_FULL_CONFIRM=1 run "$CC_SESSION" -t session_TEST --full --compact
+  assert_eq "$status" 2
+  assert_contains "$output" "don't combine sensibly"
+  assert_contains "$output" "drop --full"
+  assert_contains "$output" "drop --compact"
+}
+
 @test "--full with 'no' prints warning, aborts, creates no session" {
   run bash -c "echo no | '$CC_SESSION' -d -t session_TEST --full '$TEST_DIR' '$SESSION_NAME'"
   assert_eq "$status" 1
