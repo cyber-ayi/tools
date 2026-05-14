@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+
+<!--
+  cc-session LaunchAgent template — mbp.
+
+  PURPOSE
+    Bring up cc-session on user login, primarily as a DR fallback for
+    the bastion deployment (where the VPS hosts the primary RC entry).
+    On a typical mbp boot/relogin sequence this lets you reach the
+    Claude session via Tailscale SSH + tmux attach without manually
+    re-running cc-session.
+
+  WHY KeepAlive=false
+    cc-session's RC server is connected to Anthropic API via
+    long-poll. If the server crashes (OOM, panic, network outage
+    >10min triggering Anthropic-side timeout), restarting it
+    immediately just burns through the same failure mode and may
+    consume usage quota on retry storms. Better: surface the
+    failure (mbp's tmux session is gone, user notices on next
+    `cc-session --status`) and let the human decide.
+
+    For aggressive auto-restart, set KeepAlive=true — but expect
+    quota burn during multi-hour outages.
+
+  WHY NOT KeepAwake
+    The user runs Amphetamine.app for sleep prevention; this LaunchAgent
+    deliberately does NOT also wrap caffeinate, to avoid duplicate
+    sleep-prevention logic (and the surprise of "I disabled
+    Amphetamine but my Mac still won't sleep").
+
+  INSTALL
+    1. Copy this file to ~/Library/LaunchAgents/me.cc-session.plist
+    2. Edit the placeholders (USERNAME, PROJECT_DIR, SESSION_NAME)
+    3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/me.cc-session.plist
+    4. Verify: launchctl print gui/$(id -u)/me.cc-session
+    5. Logs: tail -f /tmp/cc-session.{out,err}.log
+
+  RESTART
+    Manual cycle (e.g., after `cc-session` script update):
+      launchctl kickstart -k gui/$(id -u)/me.cc-session
+
+  UNINSTALL
+    launchctl bootout gui/$(id -u)/me.cc-session
+    rm ~/Library/LaunchAgents/me.cc-session.plist
+-->
+
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>me.cc-session</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Adjust to wherever cc-session lives on this machine. -->
+        <string>/Users/USERNAME/bin/cc-session</string>
+        <string>-d</string>
+        <!-- Default is $HOME/cc; uncomment + edit if you want a
+             different working directory: -->
+        <!-- <string>/Users/USERNAME/projects/foo</string> -->
+        <!-- <string>SESSION_NAME</string> -->
+    </array>
+
+    <!-- Run on user login. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't blindly restart on crash — see header comment. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Inherit the user's PATH so claude, tmux, brew-installed
+         binaries are reachable. The default LaunchAgent PATH is
+         spartan; override here. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/USERNAME/.local/bin:/Users/USERNAME/.nvm/versions/node/CURRENT/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Optional: if claude binary is at a non-default location: -->
+        <!-- <key>CLAUDE_BIN</key> -->
+        <!-- <string>/path/to/claude</string> -->
+    </dict>
+
+    <!-- Logs land in /tmp; rotate via your normal /tmp lifecycle. -->
+    <key>StandardOutPath</key>
+    <string>/tmp/cc-session.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cc-session.err.log</string>
+
+    <!-- LaunchAgents that exit immediately and don't get restarted
+         (KeepAlive=false) can spam log noise during ThrottleInterval
+         retries. 30s ceiling avoids most of that. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

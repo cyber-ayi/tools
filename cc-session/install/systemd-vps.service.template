@@ -1,0 +1,91 @@
+# cc-session systemd unit template — VPS (primary RC entry).
+#
+# PURPOSE
+#   In the bastion deployment, the VPS hosts the public-facing
+#   `claude remote-control` server. This unit keeps cc-session running
+#   across reboots and respawns it on crash.
+#
+# WHY Type=forking
+#   cc-session detaches the tmux session via `tmux new-session -d`,
+#   then exits. systemd needs Type=forking to track the spawned tmux
+#   session as the service.
+#
+# WHY Restart=on-failure
+#   On VPS infrastructure (well-managed, stable network) the failure
+#   modes are bounded — primarily Anthropic API outages > 10min, where
+#   restart is the right move. Unlike the mbp LaunchAgent (which uses
+#   KeepAlive=false because user attention is the recovery loop),
+#   here we want auto-recovery because no human is watching.
+#
+#   RestartSec=30 prevents storm-of-restarts during transient outages.
+#
+# WHY no User=
+#   Unit is installed per-user (--user systemd scope), so the user is
+#   implied. If installed system-wide instead, add `User=cc-session`
+#   or whichever account owns ~/cc/ and ~/.claude/.
+#
+# INSTALL
+#   1. Copy this file to ~/.config/systemd/user/cc-session.service
+#   2. Edit the placeholders (PROJECT_DIR, SESSION_NAME, paths to
+#      cc-session and tmux if not in $PATH)
+#   3. systemctl --user daemon-reload
+#   4. systemctl --user enable --now cc-session
+#   5. systemctl --user status cc-session
+#   6. journalctl --user -u cc-session -f
+#
+#   For boot-time start (not just user-login start) on Ubuntu:
+#     loginctl enable-linger $USER
+#
+# RESTART
+#   systemctl --user restart cc-session
+#
+# UNINSTALL
+#   systemctl --user disable --now cc-session
+#   rm ~/.config/systemd/user/cc-session.service
+
+[Unit]
+Description=cc-session — claude remote-control persistent server
+Documentation=https://github.com/Jarvie8176/tools/tree/main/cc-session
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+# `cc-session -d` exits after spawning the tmux session. cc-session
+# doesn't write a pidfile, so systemd uses its GuessMainPID heuristic
+# to find the daemonized tmux child as the service's main PID.
+# (Default; explicit here for documentation.)
+GuessMainPID=yes
+
+# Edit these:
+#   - cc-session path: usually ~/.local/bin/cc-session after install
+#   - PROJECT_DIR: where claude opens (default ~/cc)
+#   - SESSION_NAME: tmux session name (default 'claude')
+ExecStart=/home/%u/.local/bin/cc-session -d %h/cc claude
+
+# Stop: tmux kill-session, then state file cleanup is handled by
+# cc-session's own --kill (which the wrapper script below invokes).
+ExecStop=/home/%u/.local/bin/cc-session --kill claude
+
+# Auto-restart on crash, but bounded.
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Inherit PATH includes Homebrew/Linuxbrew if installed, plus
+# nvm/asdf-managed claude.
+Environment="PATH=/home/%u/.local/bin:/home/%u/.nvm/versions/node/current/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
+# Optional: claude binary at non-default location
+# Environment="CLAUDE_BIN=/path/to/claude"
+
+# tmux needs a TTY conceptually, but `tmux new-session -d` works
+# without one because tmux itself daemonizes the session. systemd's
+# default StandardInput=null is fine.
+
+# Resource limits — modest. claude is mostly idle waiting on API
+# poll; spike during user turns. Adjust if you hit OOM kills.
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target
