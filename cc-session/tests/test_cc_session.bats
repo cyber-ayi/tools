@@ -138,6 +138,54 @@ marker_value() {
   assert_contains "$output" -- "--kill requires a session name"
 }
 
+@test "--kill removes the state .url file (stale URL hygiene)" {
+  # Create a session, wait for state file to appear, then --kill and
+  # confirm both the tmux session and the state file are gone.
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$state_file" ] && break
+    sleep 0.5
+  done
+  [ -f "$state_file" ]
+
+  run "$CC_SESSION" --kill "$SESSION_NAME"
+  assert_eq "$status" 0
+  [ ! -f "$state_file" ]
+  run tmux has-session -t "$SESSION_NAME"
+  refute_contains "$status" 0
+}
+
+@test "--kill on a never-existed session still cleans state file (best effort)" {
+  # Plant a stale state file from some prior cc-session that crashed.
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  mkdir -p "$(dirname "$state_file")"
+  printf 'https://claude.ai/code/session_OBSOLETE12345\n' > "$state_file"
+
+  # No tmux session of this name exists. --kill should fail (tmux exit
+  # 1) but still wipe the state file.
+  run "$CC_SESSION" --kill "$SESSION_NAME"
+  refute_contains "$status" 0
+  [ ! -f "$state_file" ]
+}
+
+@test "state file written via tmpfile-then-rename (atomic)" {
+  # Spawn a session, wait for state to land, then verify no .tmp.* file
+  # was left behind in the state dir (would indicate an interrupted write).
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -f "$state_file" ] && break
+    sleep 0.5
+  done
+  [ -f "$state_file" ]
+  # No leftover tmpfiles
+  leftover=$(find "$(dirname "$state_file")" -maxdepth 1 -name "$SESSION_NAME.url.tmp.*" 2>/dev/null | wc -l | tr -d ' ')
+  assert_eq "$leftover" "0"
+}
+
 # --- parse_session_id (exercised via --teleport) ---------------------
 
 @test "--teleport without an id exits 2" {

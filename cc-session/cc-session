@@ -258,6 +258,36 @@ parse_session_id() {
   printf '%s\n' "$raw"
 }
 
+# State file path for the captured RC URL. Single writer (the post-launch
+# subshell), multiple readers (monitoring scripts, --status, hotkey tools).
+# Writes go through a tmpfile + atomic rename so a partial read can never
+# observe truncated content.
+state_file_for() {
+  local sess="$1"
+  printf '%s/cc-session/%s.url' "${TMPDIR:-/tmp}" "$sess"
+}
+
+# Atomically write $2 to the state file for session $1. Caller is responsible
+# for ensuring the parent dir exists. Returns 0 on success, 1 if the rename
+# failed (e.g. read-only fs).
+write_state_url() {
+  local sess="$1" url="$2"
+  local target tmp state_dir
+  target="$(state_file_for "$sess")"
+  state_dir="$(dirname "$target")"
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+  tmp="$target.tmp.$$"
+  printf '%s\n' "$url" > "$tmp" 2>/dev/null || return 1
+  mv -f "$tmp" "$target" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
+# Best-effort delete of the state file. Used by --kill so a stale URL
+# pointing at a now-dead env doesn't linger and mislead later readers.
+remove_state_url() {
+  local sess="$1"
+  rm -f "$(state_file_for "$sess")" 2>/dev/null || true
+}
+
 # Pattern for Remote Control URLs surfaced in claude's TUI. Two shapes
 # appear in the wild:
 #   1. Server mode (claude remote-control):
@@ -329,7 +359,16 @@ while (( $# )); do
       exec tmux list-sessions ;;
     -k|--kill)
       [[ -z "${2:-}" ]] && { echo "$PROG: --kill requires a session name" >&2; exit 2; }
-      exec tmux kill-session -t "$2" ;;
+      # Clean state file alongside the tmux session — a stale .url
+      # pointing at a now-dead env confuses monitoring scripts and
+      # browser bookmarks. Kill the tmux session first; if it didn't
+      # exist, still wipe the state file (best-effort).
+      # `|| kill_exit=$?` both captures the exit code AND keeps `set -e`
+      # from terminating the script on a missing tmux session.
+      kill_exit=0
+      tmux kill-session -t "$2" 2>/dev/null || kill_exit=$?
+      remove_state_url "$2"
+      exit "$kill_exit" ;;
     -d|--detach)
       DETACH=1; shift ;;
     -t|--teleport)
@@ -476,8 +515,7 @@ if (( ADOPT )); then
     fi
     if url="$(enable_remote_control "$SESSION_NAME")"; then
       echo "$PROG: Remote Control on '$SESSION_NAME': $url"
-      mkdir -p "${TMPDIR:-/tmp}/cc-session" 2>/dev/null && \
-        printf '%s\n' "$url" > "${TMPDIR:-/tmp}/cc-session/$SESSION_NAME.url" 2>/dev/null || true
+      write_state_url "$SESSION_NAME" "$url" || true
       exit 0
     fi
     echo "$PROG: failed to enable Remote Control on '$SESSION_NAME' within 10s" >&2
@@ -600,9 +638,7 @@ fi
     done
   fi
   if [[ -n "$url" ]]; then
-    state_dir="${TMPDIR:-/tmp}/cc-session"
-    mkdir -p "$state_dir" 2>/dev/null && \
-      printf '%s\n' "$url" > "$state_dir/$SESSION_NAME.url" 2>/dev/null
+    write_state_url "$SESSION_NAME" "$url" || true
     tmux display-message -t "$SESSION_NAME" -d 8000 \
       "$PROG: Remote Control: $url" 2>/dev/null || true
   fi
