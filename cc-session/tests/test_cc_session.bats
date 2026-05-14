@@ -238,6 +238,44 @@ marker_value() {
   refute_contains "$output" "session: $SESSION_NAME"
 }
 
+@test "remain-on-exit preserves crashed pane buffer and --status reports alive=no" {
+  # Launch with a claude stub that exits immediately. Without
+  # remain-on-exit the pane would be destroyed and its scrollback wiped
+  # — making the crash undebuggable. With the option the pane stays
+  # with pane_dead=1, scrollback intact, and --status flips alive→no.
+  CC_FAKE_CLAUDE_CRASH=1 \
+    CC_SESSION_RC_URL_TIMEOUT=2 \
+    run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+
+  # Wait for the stub to exit and the background URL-poll to notice.
+  # The early-exit branch should fire within ~0.5s once pane_dead=1.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pd="$(tmux list-panes -s -t "$SESSION_NAME" -F '#{pane_dead}' 2>/dev/null | head -1 || true)"
+    [ "$pd" = "1" ] && break
+    sleep 0.3
+  done
+  assert_eq "$pd" "1"
+
+  # Crash output (stdout AND stderr) must still be capturable.
+  buf="$(tmux capture-pane -t "$SESSION_NAME" -p -S -200 2>/dev/null)"
+  assert_contains "$buf" "FAKE CLAUDE: crashing on purpose"
+  assert_contains "$buf" "FAKE CLAUDE: stderr line"
+
+  # --status must report alive=no even though tmux has-session=true.
+  run "$CC_SESSION" --status "$SESSION_NAME"
+  assert_eq "$status" 1
+  assert_contains "$output" "alive: no"
+  assert_contains "$output" "managed: yes"
+}
+
+@test "remain-on-exit is set as a window option on newly created sessions" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  opt="$(tmux show-window-options -t "$SESSION_NAME" -v remain-on-exit 2>/dev/null || true)"
+  assert_eq "$opt" "on"
+}
+
 @test "state file written via tmpfile-then-rename (atomic)" {
   # Spawn a session, wait for state to land, then verify no .tmp.* file
   # was left behind in the state dir (would indicate an interrupted write).
