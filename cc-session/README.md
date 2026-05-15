@@ -42,6 +42,38 @@ sudo dnf install -y zsh tmux
 CI exercises the bats suite on **both** Ubuntu and macOS runners — see
 `.github/workflows/ci.yml`'s `cc-session (bats / <os>)` job.
 
+## Updating
+
+From 0.5.1 onwards, `cc-session` self-updates:
+
+```bash
+cc-session --update            # interactive: prompts before fast-forwarding
+cc-session --update --check    # dry-run: list pending upstream commits
+```
+
+Self-update requires `cc-session` to live inside a `git clone` of this
+repo (it fast-forwards the local checkout via `git merge --ff-only`),
+and refuses to apply when the working tree is dirty, when the local
+branch has diverged commits, or when stdin is not a tty. Set
+`CC_SESSION_UPDATE_YES=1` to skip the confirmation in scripts.
+
+### One-time bootstrap to 0.5.1
+
+`--update` itself shipped in 0.5.1, so older installs need a single
+manual step to pick it up. Pick the branch that matches your install:
+
+```bash
+# Git-clone install (recommended): just pull.
+cd ~/Github/tools && git pull origin main
+
+# curl-installed (no git checkout): re-install as a git clone so that
+# --update works from now on:
+git clone https://github.com/Jarvie8176/tools.git ~/Github/tools
+ln -sf ~/Github/tools/cc-session/cc-session ~/bin/cc-session
+```
+
+After this one-time step, future upgrades are just `cc-session --update`.
+
 ## Usage
 
 ```bash

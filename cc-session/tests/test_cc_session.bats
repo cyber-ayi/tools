@@ -105,6 +105,8 @@ marker_value() {
   assert_contains "$output" CC_SESSION_RESUME_TIMEOUT
   assert_contains "$output" CC_SESSION_RC_URL_TIMEOUT
   assert_contains "$output" CC_SESSION_RC_ENABLE_TIMEOUT
+  assert_contains "$output" -- --update
+  assert_contains "$output" CC_SESSION_UPDATE_URL
 }
 
 @test "-h is an alias for --help" {
@@ -914,4 +916,137 @@ marker_value() {
   assert_contains "$output" "already running"
   second_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
   assert_eq "$first_pid" "$second_pid"
+}
+
+# --- --update --------------------------------------------------------
+
+# Build a throwaway git repo at $TEST_DIR/$1 with N empty commits.
+mk_repo() {
+  local path="$TEST_DIR/$1"; shift
+  local n="${1:-1}"
+  git init -q -b main "$path"
+  git -C "$path" config user.email "t@t"
+  git -C "$path" config user.name "t"
+  local i
+  for i in $(seq 1 "$n"); do
+    git -C "$path" commit --allow-empty -q -m "c$i"
+  done
+}
+
+@test "--update without git repo errors with install hint" {
+  CC_SESSION_UPDATE_REPO="$TEST_DIR" run "$CC_SESSION" --update
+  assert_eq "$status" 1
+  assert_contains "$output" "requires a git checkout"
+  assert_contains "$output" "git clone"
+}
+
+@test "--update --check on synced repo reports up to date" {
+  mk_repo synced 1
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/synced" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/synced" \
+    run "$CC_SESSION" --update --check
+  assert_eq "$status" 0
+  assert_contains "$output" "up to date"
+}
+
+@test "--update --check on behind repo lists upstream commits" {
+  mk_repo upstream 1
+  # Clone the upstream into 'local' before adding c2, so 'local' is one
+  # commit behind once upstream gets its second commit.
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 new upstream"
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    run "$CC_SESSION" --update --check
+  assert_eq "$status" 0
+  assert_contains "$output" "1 upstream commit"
+}
+
+@test "--update on behind repo refuses without tty + UPDATE_YES" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 new upstream"
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 1
+  assert_contains "$output" "stdin is not a tty"
+}
+
+@test "--update with UPDATE_YES fast-forwards a behind repo" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 new upstream"
+
+  local before_sha after_sha upstream_sha
+  before_sha=$(git -C "$TEST_DIR/local" rev-parse HEAD)
+  upstream_sha=$(git -C "$TEST_DIR/upstream" rev-parse HEAD)
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    CC_SESSION_UPDATE_YES=1 \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 0
+  after_sha=$(git -C "$TEST_DIR/local" rev-parse HEAD)
+  assert_eq "$after_sha" "$upstream_sha"
+  [[ "$after_sha" != "$before_sha" ]]
+}
+
+@test "--update refuses when local has diverged commits" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  # Upstream advances by one commit; local independently advances by
+  # one commit. Both branches are now 1-ahead-of-the-other.
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2-upstream"
+  git -C "$TEST_DIR/local" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2-local"
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    CC_SESSION_UPDATE_YES=1 \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to update"
+  assert_contains "$output" "not in upstream"
+}
+
+@test "--update refuses when working tree is dirty" {
+  mk_repo upstream 1
+  # Commit a tracked file in upstream so the clone has something to dirty.
+  echo "v1" > "$TEST_DIR/upstream/file"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t add file
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit -q -m "add tracked file"
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  # Upstream advances; local stays behind so the dirty check is reached.
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c3 new upstream"
+  # Modify the tracked file in local without staging/committing.
+  echo "v2-dirty" > "$TEST_DIR/local/file"
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    CC_SESSION_UPDATE_YES=1 \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 1
+  assert_contains "$output" "uncommitted changes"
+}
+
+@test "--update on local-ahead repo reports nothing to pull" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/local" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 local-only"
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 0
+  assert_contains "$output" "ahead of upstream"
 }
