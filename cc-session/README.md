@@ -50,6 +50,8 @@ cc-session ~/work/api               # custom project, session 'claude'
 cc-session ~/work/api api           # custom project, session 'api'
 cc-session -d ~/work/api api        # start 'api' detached, return to shell
 cc-session api                      # later: attach to 'api'
+cc-session -w ops/foo ~/Github/homelab-ops foo
+                                    # per-task git worktree off origin/main
 cc-session --list                   # show running sessions
 cc-session --kill claude            # terminate the 'claude' session
 cc-session --help                   # full reference
@@ -87,6 +89,48 @@ prompt.
 > (the TUI's original session was abandoned the moment the slash
 > command transitioned it away). The server-mode default in 0.3.0+
 > avoids the orphan.
+
+## Per-task worktree (`--worktree`)
+
+In a shared clone operated by multiple concurrent agents (Claude Code
+sessions, cyber-ayi, hermes), `git checkout -b` in the main clone is a
+race: every process sees the same `HEAD`, and a commit can land on
+whatever branch was checked out most recently. `--worktree NAME`
+sidesteps this by creating a fresh git worktree off `origin/main`
+(override base ref with `CC_SESSION_WORKTREE_BASE`) and launching
+claude inside it.
+
+```bash
+cc-session -w ops/foo ~/Github/homelab-ops foo
+# →  ~/Github/homelab-ops-wt/foo/   (branch ops/foo, off origin/main)
+```
+
+Layout convention: `<parent-of-repo>/<repo>-wt/<tail-of-NAME>/`. Branch
+gets the exact `NAME` (so `-w ops/foo` produces branch `ops/foo`). If
+the repo carries `scripts/bootstrap.sh` (e.g. `homelab-ops` Layer 1
+pre-push hook), cc-session runs it inside the worktree automatically.
+
+Cleanup after the task closes:
+
+```bash
+git worktree remove ../homelab-ops-wt/foo
+git worktree prune
+```
+
+Compatible with `--teleport` / `--resume` / `--detach`.
+
+### Startup hint (non-main branch detection)
+
+If you launch `cc-session` without `-w` / `--teleport` / `--resume` and
+PROJECT_DIR turns out to be a git repo whose HEAD is on a non-main branch,
+cc-session prints a one-time hint on stderr suggesting either:
+
+- (a) isolate the new task via `-w ops/<task>`, **or**
+- (b) reset the main clone back to main if the prior task is done.
+
+This catches the two common pathologies in shared multi-agent clones: a
+new task starting without isolation, and a finished task leaving the main
+clone parked on a feature branch. Suppress with `CC_SESSION_NO_WORKTREE_HINT=1`.
 
 ## Bastion deployment (VPS RC entry, macOS host as data plane)
 
