@@ -206,6 +206,9 @@ ENVIRONMENT
                                     confirmation that --full requires.
     CC_SESSION_WORKTREE_BASE        Base ref for new worktrees created
                                     via --worktree. Default: origin/main.
+    CC_SESSION_NO_WORKTREE_HINT     Set to 1 to suppress the startup hint
+                                    when PROJECT_DIR is a git repo on a
+                                    non-main branch.
 
 POST-LAUNCH URL CAPTURE
 
@@ -764,6 +767,32 @@ fi
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "$PROG: directory not found: $PROJECT_DIR" >&2
   exit 1
+fi
+
+# --- soft hint: PROJECT_DIR is a git repo on a non-main branch --------------
+# Two-symptom diagnostic:
+#   (a) "shared multi-agent clone not isolated"   → suggest -w
+#   (b) "prior task done but main clone not reset" → suggest checkout main
+# Suppress via CC_SESSION_NO_WORKTREE_HINT=1. Not printed when --worktree
+# is already in play (you're about to fix it) or --teleport/--resume is set
+# (resume is intentional re-entry on whatever branch the prior session left).
+if [[ -z "$WORKTREE_NAME" ]] && [[ -z "$TELEPORT_ID" ]] && [[ -z "$RESUME_UUID" ]] \
+   && [[ "${CC_SESSION_NO_WORKTREE_HINT:-}" != "1" ]] \
+   && git -C "$PROJECT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  cc_hint_branch="$(git -C "$PROJECT_DIR" symbolic-ref --short HEAD 2>/dev/null || true)"
+  if [[ -n "$cc_hint_branch" ]] \
+     && [[ "$cc_hint_branch" != "main" ]] \
+     && [[ "$cc_hint_branch" != "master" ]]; then
+    cat >&2 <<HINT
+$PROG: hint — '$PROJECT_DIR' is on branch '$cc_hint_branch' (not main).
+       Two likely fixes:
+         (a) new task in a shared clone — isolate via worktree:
+               $PROG -w ops/<task> $PROJECT_DIR <session>
+         (b) prior task done — return the main clone to main:
+               git -C $PROJECT_DIR checkout main
+       Suppress this hint: CC_SESSION_NO_WORKTREE_HINT=1
+HINT
+  fi
 fi
 
 # --- --worktree: create a fresh worktree, retarget PROJECT_DIR --------------

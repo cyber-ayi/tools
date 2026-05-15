@@ -360,6 +360,71 @@ marker_value() {
   assert_contains "$output" "git worktree remove"
 }
 
+@test "hint fires when PROJECT_DIR is a git repo on a non-main branch" {
+  workrepo="${TEST_DIR}/work"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m init
+  git -C "$workrepo" checkout -q -b ops/leftover
+
+  run "$CC_SESSION" -d "$workrepo" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "hint"
+  assert_contains "$output" "branch 'ops/leftover'"
+  assert_contains "$output" "-w ops/<task>"
+  assert_contains "$output" "checkout main"
+}
+
+@test "hint is silent when PROJECT_DIR is on main" {
+  workrepo="${TEST_DIR}/work"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m init
+
+  run "$CC_SESSION" -d "$workrepo" "$SESSION_NAME"
+  assert_eq "$status" 0
+  refute_contains "$output" "hint"
+}
+
+@test "hint is suppressed by CC_SESSION_NO_WORKTREE_HINT=1" {
+  workrepo="${TEST_DIR}/work"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m init
+  git -C "$workrepo" checkout -q -b ops/leftover
+
+  CC_SESSION_NO_WORKTREE_HINT=1 \
+    run "$CC_SESSION" -d "$workrepo" "$SESSION_NAME"
+  assert_eq "$status" 0
+  refute_contains "$output" "hint"
+}
+
+@test "hint is silent when --worktree is already in use" {
+  upstream="${TEST_DIR}/upstream.git"
+  workrepo="${TEST_DIR}/work"
+  git init --bare -q "$upstream"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" remote add origin "$upstream"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m init
+  git -C "$workrepo" push -q origin main
+  git -C "$workrepo" checkout -q -b ops/leftover
+
+  run "$CC_SESSION" -d -w ops/new "$workrepo" "$SESSION_NAME"
+  assert_eq "$status" 0
+  refute_contains "$output" "hint"
+}
+
+@test "hint is silent when PROJECT_DIR is not a git repo" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  refute_contains "$output" "hint"
+}
+
 @test "CC_SESSION_WORKTREE_BASE overrides the default 'origin/main' base ref" {
   upstream="${TEST_DIR}/upstream.git"
   workrepo="${TEST_DIR}/work"

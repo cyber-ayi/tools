@@ -119,6 +119,19 @@ git worktree prune
 
 Compatible with `--teleport` / `--resume` / `--detach`.
 
+### Startup hint (non-main branch detection)
+
+If you launch `cc-session` without `-w` / `--teleport` / `--resume` and
+PROJECT_DIR turns out to be a git repo whose HEAD is on a non-main branch,
+cc-session prints a one-time hint on stderr suggesting either:
+
+- (a) isolate the new task via `-w ops/<task>`, **or**
+- (b) reset the main clone back to main if the prior task is done.
+
+This catches the two common pathologies in shared multi-agent clones: a
+new task starting without isolation, and a finished task leaving the main
+clone parked on a feature branch. Suppress with `CC_SESSION_NO_WORKTREE_HINT=1`.
+
 ## Bastion deployment (VPS RC entry, macOS host as data plane)
 
 For the topology where a Tailscale-reachable VPS hosts the public
