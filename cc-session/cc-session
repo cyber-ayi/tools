@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="0.5.1"
+VERSION="0.5.2"
 
 # Absolute, symlink-resolved path to this script. Captured at top-level
 # because inside a zsh function `$0` is the function name, not the
@@ -241,6 +241,12 @@ ENVIRONMENT
     CC_SESSION_UPDATE_YES           Set to 1 to skip the interactive
                                     "[y/N]" confirmation that --update
                                     asks before fast-forwarding.
+    CC_SESSION_UPDATE_ALLOW_NONMAIN Set to 1 to silence the non-main-
+                                    branch warning emitted by --update,
+                                    and to opt in to scripted fast-
+                                    forward on a feature branch (which
+                                    is otherwise refused when
+                                    CC_SESSION_UPDATE_YES=1).
 
 POST-LAUNCH URL CAPTURE
 
@@ -636,8 +642,39 @@ update_self() {
     echo "  (none — only other tools updated in this range)"
   fi
 
+  # Warn if the current branch isn't main/master. fast-forward merge on
+  # a feature branch silently retargets it at upstream's tip, leaving
+  # the user on a confusingly-named branch whose content is now main.
+  # Surface the situation in both --check (informational) and apply
+  # paths (refuse silently in scripted CC_SESSION_UPDATE_YES=1 mode
+  # unless explicitly overridden).
+  local current_branch
+  current_branch=$(git -C "$repo_root" symbolic-ref --short HEAD 2>/dev/null || true)
+  local on_main=0
+  case "$current_branch" in
+    main|master) on_main=1 ;;
+  esac
+  if (( ! on_main )); then
+    echo
+    echo "$PROG: WARNING: current branch is '${current_branch:-(detached HEAD)}', not main/master." >&2
+    echo "         A fast-forward will move that branch ref to upstream's tip while" >&2
+    echo "         keeping its name — the result is main's content under a feature" >&2
+    echo "         branch name. Switch to main first if that's not what you want:" >&2
+    echo "           git -C $repo_root checkout main" >&2
+    echo "         Override with CC_SESSION_UPDATE_ALLOW_NONMAIN=1 to silence this." >&2
+  fi
+
   if (( check_only )); then
     return 0
+  fi
+
+  if (( ! on_main )) \
+     && [[ "${CC_SESSION_UPDATE_YES:-}" == "1" ]] \
+     && [[ "${CC_SESSION_UPDATE_ALLOW_NONMAIN:-}" != "1" ]]; then
+    echo
+    echo "$PROG: refusing to update: scripted (CC_SESSION_UPDATE_YES=1) on non-main branch '${current_branch:-detached}'." >&2
+    echo "       Set CC_SESSION_UPDATE_ALLOW_NONMAIN=1 to opt in to fast-forwarding a feature branch." >&2
+    return 1
   fi
 
   if [[ "$ahead" -gt 0 ]]; then

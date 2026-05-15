@@ -16,7 +16,19 @@ session](#recovering-a-stuck-remote-control-session) below.
 
 ## Install
 
+**Recommended (git clone)** — required for `cc-session --update` to work:
+
 ```bash
+git clone https://github.com/Jarvie8176/tools.git ~/Github/tools
+ln -sf ~/Github/tools/cc-session/cc-session ~/bin/cc-session
+```
+
+**Single-file (curl)** — lightweight, but `--update` is unavailable:
+
+```bash
+rm -f ~/bin/cc-session   # break any pre-existing symlink first; otherwise
+                         # `curl -o` follows the symlink and clobbers the
+                         # source-of-truth file in your git checkout.
 curl -fsSL https://raw.githubusercontent.com/Jarvie8176/tools/main/cc-session/cc-session -o ~/bin/cc-session
 chmod +x ~/bin/cc-session
 ```
