@@ -114,6 +114,12 @@ jobs:
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
+          # Pin the trivy binary itself, not just the action ref. The action
+          # is SHA-pinned above; without `version:` the action calls
+          # setup-trivy which downloads "latest" trivy at run time —
+          # zizmor flags this as `unpinned-tools` (medium). Bump together
+          # with the action SHA when reviewing security tooling.
+          version: v0.70.0
           scan-type: fs
           scan-ref: .
           severity: HIGH,CRITICAL
