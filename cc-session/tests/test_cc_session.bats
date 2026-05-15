@@ -338,6 +338,55 @@ marker_value() {
   # Cleanup: tmux teardown is handled by the per-test teardown.
 }
 
+@test "--worktree refuses a path that already exists" {
+  upstream="${TEST_DIR}/upstream.git"
+  workrepo="${TEST_DIR}/work"
+  git init --bare -q "$upstream"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" remote add origin "$upstream"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m init
+  git -C "$workrepo" push -q origin main
+
+  # First call succeeds.
+  run "$CC_SESSION" -d -w ops/foo "$workrepo" "${SESSION_NAME}-a"
+  assert_eq "$status" 0
+
+  # Second call with same NAME must error before touching anything.
+  run "$CC_SESSION" -d -w ops/foo "$workrepo" "${SESSION_NAME}-b"
+  assert_eq "$status" 1
+  assert_contains "$output" "worktree path already exists"
+  assert_contains "$output" "git worktree remove"
+}
+
+@test "CC_SESSION_WORKTREE_BASE overrides the default 'origin/main' base ref" {
+  upstream="${TEST_DIR}/upstream.git"
+  workrepo="${TEST_DIR}/work"
+  git init --bare -q "$upstream"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" remote add origin "$upstream"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m main-base
+  git -C "$workrepo" push -q origin main
+  # Build an alternate branch with a distinct commit, push it.
+  git -C "$workrepo" checkout -q -b alt
+  git -C "$workrepo" commit --allow-empty -q -m alt-base
+  alt_sha="$(git -C "$workrepo" rev-parse HEAD)"
+  git -C "$workrepo" push -q origin alt
+  git -C "$workrepo" checkout -q main
+
+  CC_SESSION_WORKTREE_BASE=origin/alt \
+    run "$CC_SESSION" -d -w ops/from-alt "$workrepo" "$SESSION_NAME"
+  assert_eq "$status" 0
+
+  wt="${TEST_DIR}/work-wt/from-alt"
+  wt_sha="$(git -C "$wt" rev-parse HEAD)"
+  # New branch must point at origin/alt's tip, not main's.
+  assert_eq "$wt_sha" "$alt_sha"
+}
+
 # --- parse_session_id (exercised via --teleport) ---------------------
 
 @test "--teleport without an id exits 2" {
