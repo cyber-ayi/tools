@@ -27,10 +27,24 @@ setup() {
   export TMUX_TMPDIR="${BATS_TMPDIR}/cc-session-tmux-$$"
   export TMPDIR="${BATS_TMPDIR}"
   mkdir -p "$TMUX_TMPDIR"
+
+  # Isolate lever ⑤ audit writes per test (never touch ~/.local/state).
+  export CC_SESSION_AUDIT_FILE="${TEST_DIR}/audit.jsonl"
+  # Disable the lever ④ reaper by default so the long-lived teleport
+  # tests don't each spawn a background poll loop / write reap records.
+  # The dedicated reaper tests opt back in with CC_SESSION_NO_REAP=0.
+  export CC_SESSION_NO_REAP=1
 }
 
 teardown() {
   tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+  # Lever ① auto-named teleport sessions (claude-tp-<id8>-<hex>) have
+  # dynamic names; sweep them. Safe — the tmux server is isolated to
+  # this bats run via TMUX_TMPDIR.
+  for _s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+                | grep '^claude-tp-' || true); do
+    tmux kill-session -t "$_s" 2>/dev/null || true
+  done
   rm -rf "$TEST_DIR" \
          "${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
 }
@@ -86,6 +100,16 @@ wait_for_pane() {
 
 marker_value() {
   tmux show-options -t "$1" -v '@cc-session-managed' 2>/dev/null || true
+}
+
+mode_value() {
+  tmux show-options -t "$1" -v '@cc-session-mode' 2>/dev/null || true
+}
+
+# Find the auto-allocated claude-tp-<id8>-<hex> session for a given id8.
+autoname_for() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null \
+    | grep -E "^claude-tp-$1-[0-9a-f]{6}\$" | head -1 || true
 }
 
 # --- usage / help ----------------------------------------------------
@@ -590,20 +614,23 @@ marker_value() {
          return 1; }
 }
 
-@test "--resume recycles a managed tmux session like --teleport does" {
-  # First create a managed default session
+# Behaviour change (0.6.0 / issue #35 lever ②): a --resume/--teleport
+# onto a SERVER-mode session is no longer a silent recycle — it would
+# drop every session the server multiplexes (#30), so it is refused.
+@test "--resume refuses to recycle a server-mode session (lever ②)" {
   run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0
+  assert_eq "$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-mode' 2>/dev/null || true)" "server"
   old_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
 
-  # Now --resume the same session-name; should recycle (different pid)
   run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR" "$SESSION_NAME"
-  assert_eq "$status" 0
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to recycle"
+  assert_contains "$output" "server-mode"
+  # Server-mode session must be completely untouched.
   new_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
-  [ -n "$new_pid" ] && [ "$old_pid" != "$new_pid" ]
-
-  args="$(pane_args "$SESSION_NAME")"
-  assert_contains "$args" -- "--resume d8fd4550-d9cc-4ebe-9336-c20b7408afb1"
+  assert_eq "$old_pid" "$new_pid"
+  tmux has-session -t "$SESSION_NAME"
 }
 
 @test "--resume refuses to kill an unmanaged tmux session" {
@@ -685,19 +712,21 @@ marker_value() {
   tmux has-session -t "$SESSION_NAME"
 }
 
-@test "--teleport recycles a managed session: new pid, marker re-set, args updated" {
+@test "--teleport refuses to recycle a server-mode session (lever ②, #30)" {
   run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
   assert_eq "$status" 0
+  assert_eq "$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-mode' 2>/dev/null || true)" "server"
   old_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
 
   run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "$SESSION_NAME"
-  assert_eq "$status" 0
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to recycle"
+  assert_contains "$output" "server-mode"
+  assert_contains "$output" "issue #30"
+  # The bastion-class footgun: server must survive untouched.
   new_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
-  [ -n "$new_pid" ] && [ "$old_pid" != "$new_pid" ]
+  assert_eq "$old_pid" "$new_pid"
   assert_eq "$(marker_value "$SESSION_NAME")" "1"
-
-  args="$(pane_args "$SESSION_NAME")"
-  assert_contains "$args" -- "--teleport session_TEST"
 }
 
 # --- Argument forwarding (default launch uses `remote-control`) ----
@@ -1101,4 +1130,242 @@ mk_repo() {
   local after_sha
   after_sha=$(git -C "$TEST_DIR/local" rev-parse HEAD)
   assert_eq "$after_sha" "$upstream_sha"
+}
+
+# ====================================================================
+# @cc-session-mode state machine (issue #35 levers ①②④⑤⑥⑦)
+# ====================================================================
+
+# --- mode markers ---------------------------------------------------
+
+@test "default launch stamps @cc-session-mode=server" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "$SESSION_NAME")" "server"
+  assert_eq "$(marker_value "$SESSION_NAME")" "1"
+}
+
+@test "--teleport stamps @cc-session-mode=teleport" {
+  run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "$SESSION_NAME")" "teleport"
+}
+
+@test "--resume stamps @cc-session-mode=teleport" {
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "$SESSION_NAME")" "teleport"
+}
+
+# --- ① fail-loud safe naming ----------------------------------------
+
+@test "① --teleport with no explicit name auto-allocates claude-tp-<id8>-<hex>" {
+  run "$CC_SESSION" -d -t session_DEADBEEF12345 "$TEST_DIR"
+  assert_eq "$status" 0
+  assert_contains "$output" "teleport tmux session: claude-tp-DEADBEEF-"
+  auto="$(autoname_for DEADBEEF)"
+  [ -n "$auto" ] || { echo "no claude-tp-DEADBEEF-<hex> session found"; \
+                       tmux list-sessions; return 1; }
+  assert_eq "$(mode_value "$auto")" "teleport"
+  # The bare 'claude' name (the #30 footgun) must NOT have been used.
+  # NB: `tmux has-session -t claude` prefix-matches claude-tp-*, so
+  # assert on an exact session-name listing instead.
+  if tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qx 'claude'; then
+    echo "footgun: a bare 'claude' tmux session was created"; \
+      tmux list-sessions; return 1
+  fi
+}
+
+@test "① --resume with no explicit name auto-allocates from the uuid" {
+  run "$CC_SESSION" -d --resume "d8fd4550-d9cc-4ebe-9336-c20b7408afb1" "$TEST_DIR"
+  assert_eq "$status" 0
+  auto="$(autoname_for d8fd4550)"
+  [ -n "$auto" ] || { echo "no claude-tp-d8fd4550-<hex> session"; \
+                       tmux list-sessions; return 1; }
+}
+
+@test "① name collision is a HARD ERROR, never a recycle/kill (the invariant)" {
+  # Pre-create the exact session the override will try to allocate.
+  tmux new-session -d -s "claude-tp-COLLIDE0-aaaaaa" -c "$TEST_DIR" "sleep 300"
+  victim_pid="$(tmux list-panes -t "claude-tp-COLLIDE0-aaaaaa" -F '#{pane_pid}' | head -1)"
+
+  CC_SESSION_RAND6HEX_OVERRIDE=aaaaaa \
+    run "$CC_SESSION" -d -t session_COLLIDE012345 "$TEST_DIR"
+  assert_eq "$status" 1
+  assert_contains "$output" "could not allocate a collision-free teleport tmux name"
+  assert_contains "$output" "NEVER falls back to recycling"
+
+  # Invariant: the colliding session was NOT killed/recycled.
+  run tmux has-session -t "claude-tp-COLLIDE0-aaaaaa"
+  assert_eq "$status" 0
+  still_pid="$(tmux list-panes -t "claude-tp-COLLIDE0-aaaaaa" -F '#{pane_pid}' | head -1)"
+  assert_eq "$victim_pid" "$still_pid"
+}
+
+# --- ⑥ single-session gate ------------------------------------------
+
+@test "⑥ re-teleport onto a teleport-mode session is refused (--kill first)" {
+  run "$CC_SESSION" -d -t session_GATE1 "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "$SESSION_NAME")" "teleport"
+  first_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
+
+  run "$CC_SESSION" -d -t session_GATE2 "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to reuse"
+  assert_contains "$output" "single-use"
+  # Original teleport session untouched.
+  same_pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
+  assert_eq "$first_pid" "$same_pid"
+}
+
+@test "⑥ --adopt onto a teleport-mode session is refused" {
+  run "$CC_SESSION" -d -t session_ADOPT1 "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "$SESSION_NAME")" "teleport"
+
+  run "$CC_SESSION" --adopt "$SESSION_NAME"
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to adopt"
+  assert_contains "$output" "single-use"
+  tmux has-session -t "$SESSION_NAME"
+}
+
+# --- ⑤ revive-audit -------------------------------------------------
+
+@test "⑤ --teleport writes a launch audit record then a url-captured one" {
+  audit="${TEST_DIR}/audit.jsonl"
+  run "$CC_SESSION" -d -t session_AUDITxyz "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  [ -f "$audit" ] || { echo "no audit file at $audit"; return 1; }
+  grep -q '"event":"launch"' "$audit" \
+    || { echo "no launch record:"; cat "$audit"; return 1; }
+  assert_contains "$(cat "$audit")" '"requested_id":"session_AUDITxyz"'
+  assert_contains "$(cat "$audit")" "\"tmux\":\"$SESSION_NAME\""
+
+  # url-captured is appended by the async post-launch subshell.
+  for _ in $(seq 1 40); do
+    grep -q '"event":"url-captured"' "$audit" && break
+    sleep 0.5
+  done
+  grep -q '"event":"url-captured"' "$audit" \
+    || { echo "no url-captured record:"; cat "$audit"; return 1; }
+  assert_contains "$(cat "$audit")" "session_FAKE"
+}
+
+@test "⑤ audit is best-effort: an unwritable audit path does not fail launch" {
+  CC_SESSION_AUDIT_FILE="/dev/null/nope/audit.jsonl" \
+    run "$CC_SESSION" -d -t session_BESTEFFORT "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  tmux has-session -t "$SESSION_NAME"
+}
+
+# --- ⑦ [T] display-title prefix -------------------------------------
+
+@test "⑦ teleport launch passes CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX='[T] '" {
+  run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  wait_for_pane "$SESSION_NAME" "fake claude rc-prefix:[[T] ]" 30 \
+    || { echo "rc-prefix env never reached fake-claude"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; return 1; }
+}
+
+@test "⑦ CC_SESSION_TELEPORT_TITLE_PREFIX overrides the prefix" {
+  CC_SESSION_TELEPORT_TITLE_PREFIX='QA ' \
+    run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  wait_for_pane "$SESSION_NAME" "fake claude rc-prefix:[QA ]" 30 \
+    || { echo "custom rc-prefix never reached fake-claude"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; return 1; }
+}
+
+@test "⑦ empty CC_SESSION_TELEPORT_TITLE_PREFIX disables the prefix wrapper" {
+  CC_SESSION_TELEPORT_TITLE_PREFIX='' \
+    run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  # fake-claude must still come up (resume key flow), but with no prefix.
+  wait_for_pane "$SESSION_NAME" "fake: resume key 1 received" 30 \
+    || { echo "teleport flow broke with empty prefix"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; return 1; }
+  pane="$(tmux capture-pane -t "$SESSION_NAME" -p -S -200)"
+  refute_contains "$pane" "rc-prefix"
+}
+
+@test "⑦ server-mode launch never gets the teleport prefix" {
+  run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  wait_for_pane "$SESSION_NAME" "https://claude.ai/code?environment=env_FAKE" 30 \
+    || { echo "server URL never appeared"; \
+         tmux capture-pane -t "$SESSION_NAME" -p; return 1; }
+  pane="$(tmux capture-pane -t "$SESSION_NAME" -p -S -200)"
+  refute_contains "$pane" "rc-prefix"
+}
+
+# --- ④ auto-reaper --------------------------------------------------
+
+@test "④ teleport session is reaped once its claude exits (dead pane)" {
+  export CC_SESSION_NO_REAP=0
+  export CC_SESSION_REAP_POLL=1
+  export CC_SESSION_REAP_GRACE=1
+  audit="${TEST_DIR}/audit.jsonl"
+
+  run "$CC_SESSION" -d -t session_REAP "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  # Wait until the URL is captured (proves the post-launch subshell has
+  # reached the reaper loop).
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in $(seq 1 40); do [ -f "$state_file" ] && break; sleep 0.5; done
+  [ -f "$state_file" ]
+
+  # Kill claude; remain-on-exit holds a dead pane the reaper must sweep.
+  pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
+  kill "$pid" 2>/dev/null || true
+
+  for _ in $(seq 1 60); do
+    tmux has-session -t "$SESSION_NAME" 2>/dev/null || break
+    sleep 0.5
+  done
+  run tmux has-session -t "$SESSION_NAME"
+  refute_contains "$status" 0   # session was reaped
+
+  grep -q '"event":"reap"' "$audit" \
+    || { echo "no reap audit record:"; cat "$audit" 2>/dev/null; return 1; }
+}
+
+@test "④ CC_SESSION_NO_REAP=1 preserves the dead teleport pane" {
+  # setup() exports CC_SESSION_NO_REAP=1 already — this is the default.
+  run "$CC_SESSION" -d -t session_NOREAP "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  state_file="${BATS_TMPDIR}/cc-session/$SESSION_NAME.url"
+  for _ in $(seq 1 40); do [ -f "$state_file" ] && break; sleep 0.5; done
+
+  pid="$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' | head -1)"
+  kill "$pid" 2>/dev/null || true
+  sleep 4   # longer than a default poll+grace would need
+
+  # Reaper disabled ⇒ tmux session persists with a dead pane.
+  tmux has-session -t "$SESSION_NAME"
+  pd="$(tmux list-panes -s -t "$SESSION_NAME" -F '#{pane_dead}' | head -1)"
+  assert_eq "$pd" "1"
+}
+
+@test "④ server-mode is NEVER reaped even with the reaper enabled" {
+  export CC_SESSION_NO_REAP=0
+  export CC_SESSION_REAP_POLL=1
+  export CC_SESSION_REAP_GRACE=1
+  CC_FAKE_CLAUDE_CRASH=1 CC_SESSION_RC_URL_TIMEOUT=2 \
+    run "$CC_SESSION" -d "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "$SESSION_NAME")" "server"
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pd="$(tmux list-panes -s -t "$SESSION_NAME" -F '#{pane_dead}' 2>/dev/null | head -1 || true)"
+    [ "$pd" = "1" ] && break
+    sleep 0.3
+  done
+  assert_eq "$pd" "1"
+  sleep 5   # well past poll+grace; a teleport session would be gone
+
+  # Scope guard: server-mode dead pane must persist for debuggability.
+  tmux has-session -t "$SESSION_NAME"
 }

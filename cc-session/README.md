@@ -108,7 +108,10 @@ status bar via `tmux display-message`.
 
 Each session cc-session creates is stamped with the tmux user option
 `@cc-session-managed=1` so destructive flags (`--teleport`, `--adopt`)
-refuse to touch a same-named session you set up by hand.
+refuse to touch a same-named session you set up by hand, plus
+`@cc-session-mode={server,teleport}` which drives the safety state
+machine described in [The @cc-session-mode state
+machine](#the-cc-session-mode-state-machine).
 
 ### Launch modes
 
@@ -133,6 +136,65 @@ prompt.
 > (the TUI's original session was abandoned the moment the slash
 > command transitioned it away). The server-mode default in 0.3.0+
 > avoids the orphan.
+
+## The @cc-session-mode state machine
+
+Every managed session also carries `@cc-session-mode`. The two states
+have opposite lifecycles, and conflating them is exactly the [#30
+footgun](https://github.com/Jarvie8176/tools/issues/30) (a stray
+`--teleport` killing a bastion that was multiplexing N live sessions).
+0.6.0 makes the distinction structural:
+
+| | `server` | `teleport` |
+|---|---|---|
+| Launched by | default (`claude remote-control`) | `--teleport` / `--resume` |
+| Multiplexing | one process ↔ N browser-spawned sessions ("n of 32") | one process ↔ exactly one session |
+| Default tmux name | `claude` | auto `claude-tp-<id8>-<rand6hex>` |
+| `--teleport`/`--resume`/`--adopt` onto it | **refused** (would drop all N sessions — #30) | **refused** (single-use; `--kill` first) |
+| Name collision | n/a | **hard error**, never a silent recycle/kill |
+| Display title | as-is | prefixed `[T] ` (`CC_SESSION_TELEPORT_TITLE_PREFIX`) |
+| When claude exits | dead pane preserved (debuggable) | auto-reaped (cleans UI noise) |
+| Audited | no | birth + URL-capture + reap → audit log |
+
+This means **a bare `cc-session --teleport <id>` can no longer destroy
+a server-mode RC**: with no explicit name it is auto-named to something
+that cannot collide, and even an explicit collision is a hard error
+rather than the old "kill the same-named session and recreate it".
+
+### Auto-reaper
+
+A teleport session is short-lived by nature — you revive one orphan,
+finish, done. Once its `claude` exits (dead pane), cc-session reaps the
+tmux session so it stops lingering as zombie UI noise. Tunables:
+
+```bash
+CC_SESSION_NO_REAP=1         # disable; preserve the dead pane like server-mode
+CC_SESSION_REAP_GRACE=3      # seconds to re-confirm a dead pane before reaping
+CC_SESSION_REAP_IDLE_MIN=0   # opt-in: also reap after N idle minutes (0 = off)
+```
+
+(A clean local reap does **not** instantly deregister the cloud-side
+lease — that lease ages out on its own; this just stops the *local*
+tmux clutter and shortens how long the entry looks live.)
+
+### Revive audit
+
+Teleport/resume lineage is appended to a durable, local-only JSONL log
+(default `${XDG_STATE_HOME:-~/.local/state}/cc-session/audit.jsonl`,
+override with `CC_SESSION_AUDIT_FILE`): the requested orphan id, the
+tmux name, and the derived `env_`/`session_` id once the new RC URL is
+captured. This is what answers "which new id did my old session become"
+after the fact. The audit is best-effort — a read-only state dir never
+fails a launch.
+
+### Operational rule (not enforced by code)
+
+For routine multi-session work, open new sessions from the **server-mode
+environment's URL** — that path already multiplexes cleanly as
+n-of-capacity with no ambiguity. Reserve `--teleport` strictly for
+reviving one specific orphaned session. The picker ambiguity that
+motivated this whole state machine only ever arises on the teleport
+path.
 
 ## Per-task worktree (`--worktree`)
 
@@ -254,17 +316,21 @@ cc-session --teleport 01EXAMPLEabcdef1234567890                                 
 
 cc-session will (in this order):
 
-1. Kill the same-named tmux session **only if** it was created by
-   cc-session (`@cc-session-managed=1`); recreate it fresh.
-2. Launch `claude --teleport <id>`, which fetches the cloud transcript.
-3. Wait for the **"Resume from summary / Resume full session as-is"**
+1. Allocate a collision-safe tmux name `claude-tp-<id8>-<rand6hex>`
+   (unless you passed an explicit name). It never reuses `claude`, so
+   it cannot collide with — let alone kill — a server-mode session. A
+   name collision is a hard error, never a silent recycle.
+2. Append the launch to the revive audit log.
+3. Launch `claude --teleport <id>`, which fetches the cloud transcript.
+4. Wait for the **"Resume from summary / Resume full session as-is"**
    prompt and auto-pick option 1 (summary). Override with `--full` if
    you really want to re-pay the full token cost (asks for `yes`
    confirmation; bypass with `CC_SESSION_SKIP_FULL_CONFIRM=1`).
-4. Once claude is back at an idle prompt, send `/remote-control` to
+5. Once claude is back at an idle prompt, send `/remote-control` to
    register a new Remote Control URL with `claude.ai/code`.
-5. Write the new URL to `$TMPDIR/cc-session/<SESSION_NAME>.url` and
-   flash it in the tmux status bar via `tmux display-message`.
+6. Write the new URL to `$TMPDIR/cc-session/<SESSION_NAME>.url`, append
+   the derived id to the audit log, and flash the URL in the tmux
+   status bar via `tmux display-message`.
 
 **3. Open the new URL** (the one cc-session printed) in your browser.
 The conversation is back, prefaced by a "Session resumed" marker and a
@@ -294,10 +360,12 @@ cc-session --adopt my-session       # named session
 ```
 
 `--adopt` is idempotent: if RC is already active (always the case for
-default-launched server-mode sessions; usually the case for previously
-adopted teleport sessions), it just prints the existing URL by
-reading the pane scrollback. Only falls through to a `/remote-control`
-keystroke when the URL isn't already visible in the pane.
+default-launched server-mode sessions), it just prints the existing URL
+by reading the pane scrollback. Only falls through to a
+`/remote-control` keystroke when the URL isn't already visible in the
+pane. It **refuses a `@cc-session-mode=teleport` session** — those are
+single-use and already have their URL recorded in the audit log; to
+re-register one, `--kill` it and `--teleport` again.
 
 ### What if the URL is "lost"?
 
@@ -340,7 +408,7 @@ or the cloud.
 brew install bats-core         # macOS
 sudo apt install bats          # Ubuntu
 
-bats cc-session/tests/         # 32 tests, ~10s
+bats cc-session/tests/         # full black-box suite
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same suite plus a
