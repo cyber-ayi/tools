@@ -292,6 +292,52 @@ marker_value() {
   assert_eq "$leftover" "0"
 }
 
+# --- --worktree -----------------------------------------------------
+
+@test "--worktree without a name exits 2" {
+  run "$CC_SESSION" --worktree
+  assert_eq "$status" 2
+  assert_contains "$output" -- "--worktree requires a name"
+}
+
+@test "--worktree refuses 'main' (and other protected refs)" {
+  for name in main master origin/main origin/master; do
+    run "$CC_SESSION" --worktree "$name" "$TEST_DIR" "$SESSION_NAME"
+    assert_eq "$status" 2
+    assert_contains "$output" "refusing to create worktree on '$name'"
+  done
+}
+
+@test "--worktree on a non-git PROJECT_DIR exits 1" {
+  run "$CC_SESSION" --worktree foo "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 1
+  assert_contains "$output" -- "--worktree requires PROJECT_DIR to be a git repo"
+}
+
+@test "--worktree on a real git repo creates branch + path + launches claude" {
+  # Build a tiny throwaway repo with an 'origin/main' to base off.
+  upstream="${TEST_DIR}/upstream.git"
+  workrepo="${TEST_DIR}/work"
+  git init --bare -q "$upstream"
+  git init -q -b main "$workrepo"
+  git -C "$workrepo" remote add origin "$upstream"
+  git -C "$workrepo" config user.email t@t
+  git -C "$workrepo" config user.name t
+  git -C "$workrepo" commit --allow-empty -q -m init
+  git -C "$workrepo" push -q origin main
+
+  run "$CC_SESSION" -d -w ops/foo "$workrepo" "$SESSION_NAME"
+  assert_eq "$status" 0
+  assert_contains "$output" "worktree ready"
+
+  wt="${TEST_DIR}/work-wt/foo"
+  [ -d "$wt" ] || { echo "expected worktree dir: $wt"; return 1; }
+  branch="$(git -C "$wt" rev-parse --abbrev-ref HEAD)"
+  assert_eq "$branch" "ops/foo"
+
+  # Cleanup: tmux teardown is handled by the per-test teardown.
+}
+
 # --- parse_session_id (exercised via --teleport) ---------------------
 
 @test "--teleport without an id exits 2" {

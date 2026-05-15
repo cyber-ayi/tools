@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 usage() {
   cat <<EOF
@@ -12,7 +12,7 @@ NAME
     $PROG - attach to a persistent Claude Code tmux session
 
 SYNOPSIS
-    $PROG [-t|--teleport ID-OR-URL] [-r|--resume UUID]
+    $PROG [-w|--worktree NAME] [-t|--teleport ID-OR-URL] [-r|--resume UUID]
               [-f|--full] [-c|--compact]
               [-d|--detach] [-l|--list] [-k|--kill NAME]
               [--status [SESSION_NAME]]
@@ -41,13 +41,44 @@ DESCRIPTION
 
 ARGUMENTS
     PROJECT_DIR     Directory to cd into before launching claude.
-                    Default: \$HOME/cc
+                    Default: \$HOME/cc.
+                    With --worktree, must be inside a git repo; the
+                    auto-created worktree becomes the effective cwd.
 
     SESSION_NAME    tmux session name. Use distinct names to keep multiple
                     Claude Code sessions in parallel.
                     Default: claude
 
 OPTIONS
+    -w, --worktree NAME
+                      Create a fresh git worktree off origin/main (or
+                      \$CC_SESSION_WORKTREE_BASE) and launch claude in
+                      it. PROJECT_DIR must be inside a git repo.
+
+                      Layout:
+                        <parent-of-repo>/<repo>-wt/<tail-of-NAME>/
+                      Branch name: exactly NAME (so --worktree ops/foo
+                      creates branch \`ops/foo\` at \`<repo>-wt/foo/\`).
+
+                      Use this to isolate per-task work in shared multi-
+                      agent clones where concurrent sessions would
+                      otherwise clobber each other's HEAD. Each worktree
+                      has its own HEAD; \`git worktree\` also refuses to
+                      check out the same branch twice, giving free file-
+                      level mutex on the branch name.
+
+                      If the repo has \`scripts/bootstrap.sh\` (e.g.
+                      homelab-ops Layer 1) it is run inside the new
+                      worktree automatically so hooks are wired up.
+
+                      Cleanup after the task closes:
+                        git worktree remove <path>
+                        git worktree prune
+
+                      Compatible with --teleport / --resume / --detach
+                      (worktree creation happens before claude launches,
+                      so the choice of launch mode is independent).
+
     -t, --teleport ID-OR-URL
                       Take over a Claude Code conversation that became
                       unresponsive in the browser. Kills any existing
@@ -173,6 +204,8 @@ ENVIRONMENT
                                     --teleport and --adopt paths.
     CC_SESSION_SKIP_FULL_CONFIRM    Set to 1 to skip the "type yes"
                                     confirmation that --full requires.
+    CC_SESSION_WORKTREE_BASE        Base ref for new worktrees created
+                                    via --worktree. Default: origin/main.
 
 POST-LAUNCH URL CAPTURE
 
@@ -240,6 +273,14 @@ EXAMPLES
     # claude.ai/code (run /remote-control + capture URL):
     $PROG --adopt                  # default 'claude' tmux session
     $PROG --adopt my-session-name
+
+    # Per-task worktree to avoid HEAD collisions in shared multi-agent
+    # clones. Creates ~/Github/homelab-ops-wt/foo/ off origin/main with
+    # branch 'ops/foo', launches claude there in tmux session 'foo'.
+    $PROG -w ops/foo ~/Github/homelab-ops foo
+
+    # Same, with --teleport (worktree + cloud-session reclaim combined):
+    $PROG -w ops/foo -t session_xxx ~/Github/homelab-ops foo
 
 TIPS
     Inside tmux:
@@ -490,6 +531,7 @@ RESUME_UUID=""
 RUN_COMPACT=0
 RESUME_FULL=0
 ADOPT=0
+WORKTREE_NAME=""
 while (( $# )); do
   case "$1" in
     -h|--help)
@@ -525,6 +567,10 @@ while (( $# )); do
       exit "$kill_exit" ;;
     -d|--detach)
       DETACH=1; shift ;;
+    -w|--worktree)
+      [[ -z "${2:-}" ]] && { echo "$PROG: --worktree requires a name" >&2; exit 2; }
+      WORKTREE_NAME="$2"
+      shift 2 ;;
     -t|--teleport)
       [[ -z "${2:-}" ]] && { echo "$PROG: --teleport requires a session id or URL" >&2; exit 2; }
       TELEPORT_ID="$(parse_session_id "$2")" || exit $?
@@ -718,6 +764,52 @@ fi
 if [[ ! -d "$PROJECT_DIR" ]]; then
   echo "$PROG: directory not found: $PROJECT_DIR" >&2
   exit 1
+fi
+
+# --- --worktree: create a fresh worktree, retarget PROJECT_DIR --------------
+# Runs AFTER PROJECT_DIR is finalised (including the --adopt cloud-id rebind
+# above) but BEFORE tmux/claude is launched. The new worktree path becomes
+# the effective PROJECT_DIR, so the rest of the script doesn't need to care
+# whether worktree mode was requested.
+if [[ -n "$WORKTREE_NAME" ]]; then
+  case "$WORKTREE_NAME" in
+    main|master|origin/main|origin/master)
+      echo "$PROG: refusing to create worktree on '$WORKTREE_NAME'" >&2
+      exit 2
+      ;;
+  esac
+  if ! git -C "$PROJECT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "$PROG: --worktree requires PROJECT_DIR to be a git repo (got '$PROJECT_DIR')" >&2
+    exit 1
+  fi
+  wt_repo_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel)"
+  wt_repo_name="$(basename "$wt_repo_root")"
+  wt_parent="$(dirname "$wt_repo_root")"
+  wt_tail="${WORKTREE_NAME##*/}"
+  wt_dir="${wt_parent}/${wt_repo_name}-wt/${wt_tail}"
+  wt_base="${CC_SESSION_WORKTREE_BASE:-origin/main}"
+  if [[ -e "$wt_dir" ]]; then
+    echo "$PROG: worktree path already exists: $wt_dir" >&2
+    echo "       remove it (\`git worktree remove $wt_dir\`) or pick a different --worktree NAME" >&2
+    exit 1
+  fi
+  if ! git -C "$wt_repo_root" fetch origin main 2>/dev/null; then
+    echo "$PROG: \`git fetch origin main\` failed in $wt_repo_root" >&2
+    exit 1
+  fi
+  if ! git -C "$wt_repo_root" worktree add -b "$WORKTREE_NAME" "$wt_dir" "$wt_base"; then
+    echo "$PROG: \`git worktree add\` failed" >&2
+    exit 1
+  fi
+  # If the repo carries scripts/bootstrap.sh (homelab-ops Layer 1 convention),
+  # run it inside the new worktree so core.hooksPath is wired up. Best-effort:
+  # don't fail the whole launch if bootstrap exits non-zero.
+  if [[ -x "${wt_dir}/scripts/bootstrap.sh" ]]; then
+    ( cd "$wt_dir" && ./scripts/bootstrap.sh ) || \
+      echo "$PROG: warn: bootstrap.sh in $wt_dir exited non-zero (continuing)" >&2
+  fi
+  echo "$PROG: worktree ready: $wt_dir (branch $WORKTREE_NAME off $wt_base)"
+  PROJECT_DIR="$wt_dir"
 fi
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
