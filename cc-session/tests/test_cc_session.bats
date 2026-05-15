@@ -1050,3 +1050,55 @@ mk_repo() {
   assert_eq "$status" 0
   assert_contains "$output" "ahead of upstream"
 }
+
+@test "--update --check on non-main branch warns about feature-branch ff" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 new upstream"
+  git -C "$TEST_DIR/local" checkout -q -b feat/something
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    run "$CC_SESSION" --update --check
+  assert_eq "$status" 0
+  assert_contains "$output" "WARNING"
+  assert_contains "$output" "feat/something"
+}
+
+@test "--update refuses scripted ff on non-main branch without ALLOW_NONMAIN" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 new upstream"
+  git -C "$TEST_DIR/local" checkout -q -b feat/something
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    CC_SESSION_UPDATE_YES=1 \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 1
+  assert_contains "$output" "refusing to update"
+  assert_contains "$output" "non-main branch"
+}
+
+@test "--update with ALLOW_NONMAIN fast-forwards a feature branch" {
+  mk_repo upstream 1
+  git clone -q "$TEST_DIR/upstream" "$TEST_DIR/local"
+  git -C "$TEST_DIR/upstream" -c user.email=t@t -c user.name=t \
+    commit --allow-empty -q -m "c2 new upstream"
+  git -C "$TEST_DIR/local" checkout -q -b feat/something
+
+  local upstream_sha
+  upstream_sha=$(git -C "$TEST_DIR/upstream" rev-parse HEAD)
+
+  CC_SESSION_UPDATE_REPO="$TEST_DIR/local" \
+    CC_SESSION_UPDATE_URL="$TEST_DIR/upstream" \
+    CC_SESSION_UPDATE_YES=1 \
+    CC_SESSION_UPDATE_ALLOW_NONMAIN=1 \
+    run "$CC_SESSION" --update
+  assert_eq "$status" 0
+  local after_sha
+  after_sha=$(git -C "$TEST_DIR/local" rev-parse HEAD)
+  assert_eq "$after_sha" "$upstream_sha"
+}
