@@ -4,7 +4,12 @@
 set -euo pipefail
 
 PROG="${0##*/}"
-VERSION="0.5.0"
+VERSION="0.5.1"
+
+# Absolute, symlink-resolved path to this script. Captured at top-level
+# because inside a zsh function `$0` is the function name, not the
+# script. Used by --update to locate the enclosing git checkout.
+SCRIPT_PATH="${0:A}"
 
 usage() {
   cat <<EOF
@@ -18,6 +23,7 @@ SYNOPSIS
               [--status [SESSION_NAME]]
               [-v|--version] [-h|--help] [PROJECT_DIR] [SESSION_NAME]
     $PROG -a|--adopt [SESSION_NAME]
+    $PROG -u|--update [--check]
 
 DESCRIPTION
     Starts (or re-attaches to) a tmux session running Claude Code in
@@ -185,6 +191,20 @@ OPTIONS
                       monitoring loops.
     -v, --version     Print version ($PROG $VERSION) and exit.
     -h, --help        Show this help and exit.
+    -u, --update      Pull the latest cc-session from the upstream git
+                      repo (default https://github.com/Jarvie8176/tools)
+                      and fast-forward the local checkout. Refuses if
+                      the working tree is dirty, if the local branch
+                      has diverged (local commits not upstream), or if
+                      stdin is not a tty (set CC_SESSION_UPDATE_YES=1
+                      to auto-apply non-interactively). Pass --check
+                      after --update to show pending commits without
+                      applying.
+
+                      Requires $PROG to live inside a git checkout
+                      (the default \`git clone\` install). Override the
+                      upstream URL/branch via CC_SESSION_UPDATE_URL /
+                      CC_SESSION_UPDATE_BRANCH if you mirror or fork.
 
 ENVIRONMENT
     CLAUDE_BIN                      Path to the claude binary.
@@ -209,6 +229,18 @@ ENVIRONMENT
     CC_SESSION_NO_WORKTREE_HINT     Set to 1 to suppress the startup hint
                                     when PROJECT_DIR is a git repo on a
                                     non-main branch.
+    CC_SESSION_UPDATE_URL           Upstream git URL used by --update.
+                                    Default:
+                                      https://github.com/Jarvie8176/tools.git
+    CC_SESSION_UPDATE_BRANCH        Upstream branch used by --update.
+                                    Default: main.
+    CC_SESSION_UPDATE_REPO          Override the local repo root that
+                                    --update operates on. Default: walk
+                                    up from this script until a .git
+                                    directory is found.
+    CC_SESSION_UPDATE_YES           Set to 1 to skip the interactive
+                                    "[y/N]" confirmation that --update
+                                    asks before fast-forwarding.
 
 POST-LAUNCH URL CAPTURE
 
@@ -527,6 +559,133 @@ enable_remote_control() {
   return 1
 }
 
+# Fast-forward the cc-session git checkout from upstream and report
+# what changed. Returns 0 on success / already-up-to-date / dry-run,
+# non-zero if the update is refused or git operations fail.
+#
+# With --check, the function only reports divergence — never modifies
+# the working tree. Without --check, it refuses to apply unless:
+#   - the local checkout is strictly behind upstream (no diverged
+#     commits — the user's own local work is never silently rebased
+#     away), AND
+#   - the working tree has no modified/staged files (untracked files
+#     are tolerated), AND
+#   - stdin is a tty OR CC_SESSION_UPDATE_YES=1.
+update_self() {
+  local check_only=0
+  if [[ "${1:-}" == "--check" ]]; then check_only=1; fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "$PROG: --update requires git, which was not found in PATH" >&2
+    return 1
+  fi
+
+  # Locate the enclosing git checkout. Start from the script's real
+  # path so that the symlink under ~/bin still resolves to the source
+  # tree. Allow CC_SESSION_UPDATE_REPO to override for unusual installs
+  # (and for the bats tests, which can't touch the real repo).
+  local repo_root="${CC_SESSION_UPDATE_REPO:-}"
+  if [[ -z "$repo_root" ]]; then
+    repo_root="${SCRIPT_PATH:h}"
+    while [[ "$repo_root" != "/" ]] && [[ ! -d "$repo_root/.git" ]]; do
+      repo_root="${repo_root:h}"
+    done
+  fi
+  if [[ ! -d "$repo_root/.git" ]] && [[ ! -f "$repo_root/.git" ]]; then
+    echo "$PROG: --update requires a git checkout." >&2
+    echo "       $SCRIPT_PATH is not inside a git repo." >&2
+    echo "       Install via: git clone https://github.com/Jarvie8176/tools.git ~/Github/tools" >&2
+    return 1
+  fi
+
+  local update_url="${CC_SESSION_UPDATE_URL:-https://github.com/Jarvie8176/tools.git}"
+  local update_branch="${CC_SESSION_UPDATE_BRANCH:-main}"
+
+  echo "$PROG: fetching $update_url $update_branch ..." >&2
+  if ! git -C "$repo_root" fetch -q "$update_url" "$update_branch"; then
+    echo "$PROG: git fetch failed (network? bad URL?)" >&2
+    return 1
+  fi
+
+  local local_sha remote_sha
+  local_sha=$(git -C "$repo_root" rev-parse HEAD)
+  remote_sha=$(git -C "$repo_root" rev-parse FETCH_HEAD)
+
+  if [[ "$local_sha" == "$remote_sha" ]]; then
+    echo "$PROG: already up to date (HEAD = ${local_sha:0:7}, version $VERSION)"
+    return 0
+  fi
+
+  local behind ahead
+  behind=$(git -C "$repo_root" rev-list --count HEAD..FETCH_HEAD)
+  ahead=$(git -C "$repo_root" rev-list --count FETCH_HEAD..HEAD)
+
+  if [[ "$behind" -eq 0 ]]; then
+    echo "$PROG: local is $ahead commit(s) ahead of upstream; nothing to pull."
+    return 0
+  fi
+
+  echo "$PROG: $behind upstream commit(s) to pull, $ahead local commit(s) ahead."
+  echo
+  echo "Upstream commits affecting cc-session/:"
+  local cc_commits
+  cc_commits=$(git -C "$repo_root" log --oneline HEAD..FETCH_HEAD -- cc-session/ 2>/dev/null)
+  if [[ -n "$cc_commits" ]]; then
+    printf '%s\n' "$cc_commits" | head -20
+  else
+    echo "  (none — only other tools updated in this range)"
+  fi
+
+  if (( check_only )); then
+    return 0
+  fi
+
+  if [[ "$ahead" -gt 0 ]]; then
+    echo
+    echo "$PROG: refusing to update: local branch has $ahead commit(s) not in upstream." >&2
+    echo "       Rebase or merge manually, then re-run --update:" >&2
+    echo "         git -C $repo_root pull --rebase $update_url $update_branch" >&2
+    return 1
+  fi
+
+  local dirty
+  dirty=$(git -C "$repo_root" status --porcelain --untracked-files=no)
+  if [[ -n "$dirty" ]]; then
+    echo
+    echo "$PROG: refusing to update: working tree has uncommitted changes." >&2
+    echo "       Stash or commit first, then re-run --update." >&2
+    return 1
+  fi
+
+  if [[ ! -t 0 ]] && [[ "${CC_SESSION_UPDATE_YES:-}" != "1" ]]; then
+    echo
+    echo "$PROG: stdin is not a tty; refusing to apply without confirmation." >&2
+    echo "       Set CC_SESSION_UPDATE_YES=1 to apply non-interactively," >&2
+    echo "       or re-run with --update --check to dry-run." >&2
+    return 1
+  fi
+
+  if [[ -t 0 ]] && [[ "${CC_SESSION_UPDATE_YES:-}" != "1" ]]; then
+    printf '\nApply update via fast-forward merge? [y/N] '
+    local reply
+    read -r reply
+    if [[ "$reply" != "y" ]] && [[ "$reply" != "Y" ]]; then
+      echo "Aborted."
+      return 1
+    fi
+  fi
+
+  if ! git -C "$repo_root" merge --ff-only FETCH_HEAD; then
+    echo "$PROG: merge --ff-only failed (concurrent update?). Resolve manually." >&2
+    return 1
+  fi
+
+  local new_version
+  new_version=$(grep -m1 '^VERSION=' "$SCRIPT_PATH" 2>/dev/null | cut -d'"' -f2)
+  echo
+  echo "$PROG: updated to ${new_version:-?} (HEAD = $(git -C "$repo_root" rev-parse --short HEAD))"
+}
+
 # --- arg parsing -------------------------------------------------------------
 DETACH=0
 TELEPORT_ID=""
@@ -541,6 +700,15 @@ while (( $# )); do
       usage; exit 0 ;;
     -v|--version)
       printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+    -u|--update)
+      # Optional `--check` modifier: dry-run, no working-tree mutation.
+      shift
+      if [[ "${1:-}" == "--check" ]]; then
+        update_self --check
+        exit $?
+      fi
+      update_self
+      exit $? ;;
     -l|--list)
       exec tmux list-sessions ;;
     --status)
