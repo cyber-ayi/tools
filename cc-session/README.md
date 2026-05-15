@@ -152,7 +152,7 @@ footgun](https://github.com/Jarvie8176/tools/issues/30) (a stray
 | Default tmux name | `claude` | auto `claude-tp-<id8>-<rand6hex>` |
 | `--teleport`/`--resume`/`--adopt` onto it | **refused** (would drop all N sessions — #30) | **refused** (single-use; `--kill` first) |
 | Name collision | n/a | **hard error**, never a silent recycle/kill |
-| Display title | as-is | prefixed `[T] ` (`CC_SESSION_TELEPORT_TITLE_PREFIX`) |
+| Display title | as-is | `[T] ` prefix env (`CC_SESSION_TELEPORT_TITLE_PREFIX`) — see caveat |
 | When claude exits | dead pane preserved (debuggable) | auto-reaped (cleans UI noise) |
 | Audited | no | birth + URL-capture + reap → audit log |
 
@@ -160,6 +160,15 @@ This means **a bare `cc-session --teleport <id>` can no longer destroy
 a server-mode RC**: with no explicit name it is auto-named to something
 that cannot collide, and even an explicit collision is a hard error
 rather than the old "kill the same-named session and recreate it".
+
+> **`[T] ` caveat (servarica e2e):** the prefix is exported as
+> `CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX` to the teleport claude,
+> but the bastion e2e confirmed it does **not** surface in the
+> claude.ai/code FleetView title for teleported sessions — preserving
+> or exposing a resumed session's title is an upstream
+> (`anthropics/claude-code`) gap. The prefix is kept as a harmless,
+> correct-by-construction local/terminal hint; the FleetView
+> disambiguation is tracked for the deferred upstream issue.
 
 ### Auto-reaper
 

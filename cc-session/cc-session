@@ -253,12 +253,17 @@ ENVIRONMENT
                                     is otherwise refused when
                                     CC_SESSION_UPDATE_YES=1).
     CC_SESSION_TELEPORT_TITLE_PREFIX
-                                    Prefix prepended to the Remote
-                                    Control display title of a
-                                    --teleport/--resume session so it
-                                    is distinguishable at a glance from
-                                    server-mode entries. Default:
-                                    "[T] ". Set to '' to disable.
+                                    Exported as
+                                    CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX
+                                    to the --teleport/--resume claude.
+                                    Default "[T] "; '' disables. NOTE:
+                                    bastion e2e showed this does NOT
+                                    surface in the claude.ai/code
+                                    FleetView title for teleported
+                                    sessions (upstream limitation —
+                                    see README); kept as a harmless
+                                    local/terminal-title hint until
+                                    upstream exposes it.
     CC_SESSION_AUDIT_FILE           Override the teleport/resume audit
                                     log path. Default:
                                     \${XDG_STATE_HOME:-~/.local/state}/
@@ -401,8 +406,9 @@ TIPS
                        first to reuse the name.
                      • audited at birth + on URL capture + on reap
                        (see CC_SESSION_AUDIT_FILE).
-                     • labelled with CC_SESSION_TELEPORT_TITLE_PREFIX
-                       ("[T] ") in the Remote Control UI.
+                     • tagged via CC_SESSION_TELEPORT_TITLE_PREFIX
+                       ("[T] ") — local/terminal hint only; does NOT
+                       reach claude.ai/code FleetView (upstream-gated).
                      • auto-reaped: once its claude exits (dead pane),
                        the tmux session is cleaned up so it stops
                        lingering as UI noise (CC_SESSION_NO_REAP=1 to
@@ -434,6 +440,25 @@ EOF
 }
 
 # --- helpers -----------------------------------------------------------------
+# Exact-session safety. tmux resolves a bare `-t name` by
+# exact → PREFIX → fnmatch. With a server-mode `claude` plus an
+# auto-named `claude-tp-<id8>-<hex>` teleport coexisting, once the
+# exact `claude` is gone a bare `-t claude` silently PREFIX-matches the
+# teleport — which let the ② guard / --kill / --status / reaper act on
+# the WRONG session (servarica e2e run #1, Phase 4). The `=name`
+# exact-match target is NOT a portable fix: tmux 3.6a's show-options /
+# set-option reject `-t "=name"` ("no such session: =name"). What IS
+# reliable: tmux always tries an EXACT match first, so a plain
+# `-t name` is unambiguous *iff an exactly-named session exists*. So
+# every safety-critical op is gated on sess_exists() (exact-name
+# presence via list-sessions) before touching a plain `-t name`; if
+# the exact session is absent we treat it as "not there" instead of
+# letting tmux fall through to a prefix neighbour.
+sess_exists() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null \
+    | grep -qxF -- "$1"
+}
+
 # Validate an on-disk session UUID for `--resume`. claude stores
 # sessions at `~/.claude/projects/<project>/<uuid>.jsonl`; the uuid is
 # canonical 8-4-4-4-12 hex. Different ID space from cloud session_xxx.
@@ -610,7 +635,7 @@ emit_audit() {
 # managed session is alive, 1 otherwise.
 print_status_one() {
   local sess="$1" alive=no managed=no url="" uptime=""
-  if tmux has-session -t "$sess" 2>/dev/null; then
+  if sess_exists "$sess"; then
     # remain-on-exit keeps panes around after claude dies, so the
     # session can outlive its only live process. Count panes whose
     # process is still running (pane_dead=0).
@@ -929,8 +954,15 @@ while (( $# )); do
       # exist, still wipe the state file (best-effort).
       # `|| kill_exit=$?` both captures the exit code AND keeps `set -e`
       # from terminating the script on a missing tmux session.
+      # Only kill when an EXACTLY-named session exists — never let
+      # `--kill claude` prefix-match (and destroy) a `claude-tp-…`
+      # teleport when no exact `claude` is present (see sess_exists).
       kill_exit=0
-      tmux kill-session -t "$2" 2>/dev/null || kill_exit=$?
+      if sess_exists "$2"; then
+        tmux kill-session -t "$2" 2>/dev/null || kill_exit=$?
+      else
+        kill_exit=1
+      fi
       remove_state_url "$2"
       exit "$kill_exit" ;;
     -d|--detach)
@@ -1118,7 +1150,7 @@ if (( ADOPT )); then
       exit 2
     fi
     SESSION_NAME="${adopt_arg:-claude}"
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    if ! sess_exists "$SESSION_NAME"; then
       echo "$PROG: tmux session '$SESSION_NAME' does not exist (nothing to adopt)" >&2
       exit 1
     fi
@@ -1277,12 +1309,16 @@ if [[ "$CC_MODE" == teleport ]] && (( ! SESSION_NAME_EXPLICIT )); then
   echo "$PROG: teleport tmux session: $SESSION_NAME" >&2
 fi
 
-# Lever ⑦: prefix the Remote Control display title with a human marker
-# so a teleported entry is distinguishable at a glance from server-mode
-# ones. Passed through `env` into the claude process (see launch below)
-# rather than a CLI flag, so it cannot break `claude --teleport` if the
-# flag name ever changes, and it survives the tmux exec-no-shell path.
-# Set CC_SESSION_TELEPORT_TITLE_PREFIX='' to disable. Default: "[T] ".
+# Lever ⑦: export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX to the
+# teleport/resume claude via `env` (see launch below) — not a CLI flag,
+# so it can't break `claude --teleport` if the flag name drifts, and it
+# survives the tmux exec-no-shell path. Set
+# CC_SESSION_TELEPORT_TITLE_PREFIX='' to disable. Default: "[T] ".
+# CAVEAT (servarica e2e run #1, 2026-05-15): this env var does NOT
+# surface in the claude.ai/code FleetView title for teleported
+# sessions — preserving/exposing the resumed session title is
+# upstream-gated (tracked for the deferred anthropics/claude-code
+# issue). Kept as a harmless, correct-by-construction local hint.
 CC_TP_PREFIX="${CC_SESSION_TELEPORT_TITLE_PREFIX-[T] }"
 
 CLAUDE_BIN="${CLAUDE_BIN:-$HOME/.local/bin/claude}"
@@ -1322,7 +1358,7 @@ if [[ -n "$TELEPORT_ID" ]] || [[ -n "$RESUME_UUID" ]]; then
   # @cc-session-managed tmux user option (set after new-session below);
   # refuse to kill anything without that marker so we don't clobber a
   # same-named session the user set up by hand.
-  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if sess_exists "$SESSION_NAME"; then
     managed="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-managed' 2>/dev/null || true)"
     existing_mode="$(tmux show-options -t "$SESSION_NAME" -v '@cc-session-mode' 2>/dev/null || true)"
     if [[ "$managed" != "1" ]]; then
@@ -1394,7 +1430,7 @@ if [[ "$CC_MODE" == teleport ]] && [[ -n "$CC_TP_PREFIX" ]]; then
 fi
 
 created=""
-if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+if ! sess_exists "$SESSION_NAME"; then
   tmux new-session -d -s "$SESSION_NAME" -c "$PROJECT_DIR" "${LAUNCH_CMD[@]}"
   # Set options only if the session is still here. A claude that crashes
   # in <a few ms (rare with real claude, possible with stub binaries)
@@ -1402,7 +1438,7 @@ if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
   # this guard `set -e` would propagate the inner tmux failure and
   # cc-session would exit 1 even though "claude crashed" is the very
   # case we want to surface via --status, not via a shell error.
-  if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  if sess_exists "$SESSION_NAME"; then
     tmux set-option -t "$SESSION_NAME" -q '@cc-session-managed' '1' || true
     # @cc-session-mode drives the whole state machine: lever ② reads it
     # to refuse killing a server, ⑥ to refuse reusing a teleport, ④ to
@@ -1549,7 +1585,7 @@ fi
       sleep "$reap_poll"
       # Session already gone (explicit --kill, or another reaper won):
       # close the lineage and stop.
-      if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+      if ! sess_exists "$SESSION_NAME"; then
         emit_audit reap teleport "$cc_kind" "$cc_req_id" "$SESSION_NAME" "$cc_full" "$PROJECT_DIR" "" gone
         break
       fi

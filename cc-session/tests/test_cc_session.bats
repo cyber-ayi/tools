@@ -42,7 +42,7 @@ teardown() {
   # dynamic names; sweep them. Safe — the tmux server is isolated to
   # this bats run via TMUX_TMPDIR.
   for _s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-                | grep '^claude-tp-' || true); do
+                | grep -E "^claude-tp-|$SESSION_NAME" || true); do
     tmux kill-session -t "$_s" 2>/dev/null || true
   done
   rm -rf "$TEST_DIR" \
@@ -104,6 +104,13 @@ marker_value() {
 
 mode_value() {
   tmux show-options -t "$1" -v '@cc-session-mode' 2>/dev/null || true
+}
+
+# Exact-name existence (mirrors cc-session's sess_exists): tmux's own
+# `has-session -t name` would prefix-match, so grep the session list
+# for an exact line instead.
+has_exact() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF -- "$1"
 }
 
 # Find the auto-allocated claude-tp-<id8>-<hex> session for a given id8.
@@ -1368,4 +1375,54 @@ mk_repo() {
 
   # Scope guard: server-mode dead pane must persist for debuggability.
   tmux has-session -t "$SESSION_NAME"
+}
+
+# ====================================================================
+# tmux exact-match target regression (servarica e2e run #1 finding):
+# tmux resolves `-t name` by exact→PREFIX→fnmatch. With a server-mode
+# `claude` plus an auto `claude-tp-<id8>-<hex>`, once exact `claude`
+# is gone a bare `-t claude` silently prefix-matched the teleport —
+# ②/--kill/--status/reaper acted on the WRONG session. cc-session now
+# uses `-t "=NAME"` everywhere it must hit one exact session.
+# ====================================================================
+
+@test "exact-match: --kill NAME never prefix-kills a NAME-prefixed neighbour" {
+  # Only '<NAME>LONG' exists; there is NO exact '<NAME>' session.
+  run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "${SESSION_NAME}LONG"
+  assert_eq "$status" 0
+  has_exact "${SESSION_NAME}LONG"
+
+  run "$CC_SESSION" --kill "$SESSION_NAME"
+  refute_contains "$status" 0          # no exact match -> nothing killed
+  # The prefix neighbour must be untouched (pre-fix it got killed).
+  has_exact "${SESSION_NAME}LONG"
+}
+
+@test "exact-match: --teleport NAME with only NAME-prefixed present doesn't mis-resolve" {
+  # A teleport-mode '<NAME>LONG' exists; NO exact '<NAME>'.
+  run "$CC_SESSION" -d -t session_AAA "$TEST_DIR" "${SESSION_NAME}LONG"
+  assert_eq "$status" 0
+  assert_eq "$(mode_value "${SESSION_NAME}LONG")" "teleport"
+
+  # cc-session -t ... NAME must NOT prefix-resolve to '<NAME>LONG' and
+  # emit a bogus ⑥/② refusal (the exact servarica Phase-4 symptom);
+  # it should create the genuine exact '<NAME>'.
+  run "$CC_SESSION" -d -t session_BBB "$TEST_DIR" "$SESSION_NAME"
+  assert_eq "$status" 0
+  refute_contains "$output" "refusing to reuse"
+  refute_contains "$output" "refusing to recycle"
+  has_exact "$SESSION_NAME"
+  assert_eq "$(mode_value "$SESSION_NAME")" "teleport"
+  has_exact "${SESSION_NAME}LONG"   # neighbour untouched
+}
+
+@test "exact-match: --status NAME ignores a NAME-prefixed neighbour" {
+  run "$CC_SESSION" -d -t session_TEST "$TEST_DIR" "${SESSION_NAME}LONG"
+  assert_eq "$status" 0
+
+  run "$CC_SESSION" --status "$SESSION_NAME"
+  assert_eq "$status" 1                 # exact NAME absent -> not alive
+  assert_contains "$output" "session: $SESSION_NAME"
+  assert_contains "$output" "alive: no"
+  refute_contains "$output" "${SESSION_NAME}LONG"
 }
