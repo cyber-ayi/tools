@@ -28,6 +28,16 @@
 
 echo "fake claude args: $*"
 
+# Lever ⑦ observability: cc-session wraps teleport/resume launches in
+# `env CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=...`. Echo it so bats
+# can assert the prefix actually reached the claude process (the real
+# claude consumes it to label the RC display title).
+if [ -n "${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-}" ]; then
+  # Bracket the value so a trailing space survives tmux capture-pane
+  # (which strips trailing whitespace from each captured line).
+  echo "fake claude rc-prefix:[$CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX]"
+fi
+
 # Crash mode: simulate claude dying on startup before printing any URL.
 # Used by tests that exercise remain-on-exit (pane preservation) and the
 # dead-pane alive=no path. Prints something on both stdout and stderr so
