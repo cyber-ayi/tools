@@ -73,7 +73,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install zizmor
+      # Pin zizmor itself. `pip install zizmor` (no version) lets every
+      # minor release silently introduce new audit rules — main passed last
+      # under v1.24.1, then a v1.25.0 PR-run flipped because the new
+      # `unpinned-tools` rule fired. Bump deliberately when reviewing
+      # security tooling.
+      - run: pip install 'zizmor==1.25.0'
       - name: Audit workflows
         # Static analysis tuned for GitHub Actions: catches template injection,
         # missing permissions, dangerous triggers (pull_request_target +
