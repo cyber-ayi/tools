@@ -238,6 +238,13 @@ def _refresh_local(
             # it would make the two manifests never match.
             if cache.is_sidecar(fn):
                 continue
+            # Exclude rclone's in-flight/leftover temp files. A `.partial`
+            # is an incomplete copy (often huge), never real data — hashing
+            # it wastes time and pollutes the manifest/MHL. refresh runs
+            # before copy's stale-partial cleanup (Stage G), so this guard
+            # is what actually keeps a leftover out of the manifest.
+            if fn.endswith(".partial"):
+                continue
             full_path = Path(dirpath) / fn
             try:
                 st = full_path.stat()

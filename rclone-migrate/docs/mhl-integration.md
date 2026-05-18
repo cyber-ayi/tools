@@ -120,7 +120,7 @@ Each generation is one XML file per side. Structure (full example):
   <creatorinfo>
     <creationdate>2026-05-06T10:32:14+00:00</creationdate>
     <hostname>workstation.local</hostname>
-    <tool version="0.8.3">rclone-migrate</tool>
+    <tool version="0.8.4">rclone-migrate</tool>
     <author>Me &lt;me@example.com&gt;</author>
   </creatorinfo>
   <processinfo>

@@ -148,6 +148,23 @@ def test_readonly_resolve_matches_mutating_after_migration(tmp_path):
     assert ro_db == rw_db and ro_id == dsid
 
 
+def test_partial_files_excluded_from_manifest(tmp_path):
+    """rclone `.partial` temps (often huge leftovers) must never be hashed
+    or land in the manifest — refresh runs before Stage G cleanup."""
+    root = tmp_path / "dst"; root.mkdir()
+    (root / "VID_001.insv").write_bytes(b"real" * 8)
+    (root / "VID_002.insv.b856018f.partial").write_bytes(b"x" * 4096)
+    (root / "VID_003.insv.partial").write_bytes(b"y" * 16)
+    m = manifest._refresh_local(
+        "dst", str(root), "sha256",
+        transfers=1, full=False, local_cache_in_root=False,
+        fallback_dir=tmp_path / "fb", progress=False, v=_v(),
+    )
+    paths = {e.path for e in m.entries}
+    assert "VID_001.insv" in paths
+    assert not any(p.endswith(".partial") for p in paths)
+
+
 def test_meta_dataset_id_roundtrip(tmp_path):
     db = tmp_path / "x.db"
     c = cache.open_db(db)
