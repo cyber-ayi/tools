@@ -115,9 +115,13 @@ def test_rsync_copyto_argv(monkeypatch, tmp_path):
 
     monkeypatch.setattr(rclone.subprocess, "run", fake_run)
     rclone.rsync_copyto(str(tmp_path / "s"), str(tmp_path / "sub" / "d"))
-    assert captured["argv"][1:] == ["--append", "--times",
-                                    str(tmp_path / "s"),
+    # --partial is the RCA fix: openrsync deletes a partial on interrupt
+    # without it → only a fluke partial survives ("resume only from the
+    # first break"). --inplace explicit (--append implies it on openrsync).
+    assert captured["argv"][1:] == ["--partial", "--inplace", "--append",
+                                    "--times", str(tmp_path / "s"),
                                     str(tmp_path / "sub" / "d")]
+    assert "--partial" in captured["argv"]   # guard the RCA regression
 
 
 @pytest.mark.skipif(__import__("shutil").which("rsync") is None,

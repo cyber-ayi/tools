@@ -292,22 +292,33 @@ def have_rsync() -> bool:
 
 
 def rsync_copyto(src: str, dst: str) -> None:
-    """Resumable single-file copy via `rsync --append` (#236 part 1).
+    """Resumable single-file copy (#236 part 1).
 
-    rclone cannot resume a file across process death; rsync `--append`
-    grows the destination in place, so a killed transfer continues from
-    the current dst length next run instead of restarting from 0.
-    `--append` (NOT `--append-verify`) by design: rmig's own post-copy
-    xxh3 dst re-hash + MHL is the single integrity gate for both engines
-    — rsync's slow whole-file md5 verify would just double the full read.
-    A bad append ⇒ hash mismatch ⇒ rmig re-copies whole = same worst case
-    as today, never worse. Caller guarantees dst is local.
+    `rsync --partial --inplace --append`:
+      * `--partial` is REQUIRED. macOS ships **openrsync**, which removes
+        a partially-transferred file on interruption *unless* --partial
+        (`man rsync`: "--partial: Do not remove partially transferred
+        files if openrsync is interrupted"). Without it every killed run
+        discards its progress and only a fluke-surviving partial sticks
+        — the "resumes only from the first break" bug (RCA).
+      * `--append` extends a shorter dst by the missing tail; it implies
+        --inplace (we also pass it explicitly for non-openrsync rsync).
+        Together: a kill leaves the grown dst; the next run continues
+        from the new length → true progressive resume across repeated
+        interruptions.
+
+    `--append` not `--append-verify`: rmig's post-copy xxh3 dst re-hash
+    + MHL is the single integrity gate for both engines; openrsync's
+    --append already whole-file-checksums and delta-heals a bad prefix
+    at the end, so a corrupt tail can't silently pass — and rmig's xxh3
+    is the authoritative DIT check regardless. Caller guarantees dst
+    is local.
     """
     rb = shutil.which("rsync")
     if not rb:
         raise RcloneError("rsync not found in PATH")
     os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-    full = [rb, "--append", "--times", src, dst]
+    full = [rb, "--partial", "--inplace", "--append", "--times", src, dst]
     if _VERBOSE_HOOK is not None and _VERBOSE_HOOK.is_detail():
         import shlex
         _VERBOSE_HOOK.detail("    $ " + " ".join(shlex.quote(a) for a in full))
