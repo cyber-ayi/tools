@@ -373,16 +373,16 @@ def do_copy(
             plan.to_copy, job, cfg, use_rsync, v if progress else None
         )
 
-        # Stage G: under the job lock, clear partials orphaned by a prior
-        # interrupted run so they can't wedge this one (#157/#212). Only
-        # for rclone-engine files — an rsync-engine file's growing final
-        # dst (no .partial) IS its resume base; never touch it.
+        # Stage G: under the job lock, clear `.partial` orphaned by a
+        # prior interrupted run so they can't wedge this one (#157/#212).
+        # ALL to-copy files, regardless of engine: `.partial` is rclone's
+        # temp suffix only — an rsync-engine file's resume base is the
+        # *final* name (never matched by `*.partial`), so cleaning is
+        # inherently safe for it. (Filtering to rclone-engine here was an
+        # over-correction that orphaned the rclone `.partial` of files
+        # since reassigned to the rsync engine — they were never cleaned.)
         if clean_partial and not dry_run:
-            _clean_stale_partials(
-                job,
-                [e for e in plan.to_copy if engine[e.path] == "rclone"],
-                v,
-            )
+            _clean_stale_partials(job, plan.to_copy, v)
 
         failures = 0
         copied_dst_paths: List[str] = []
