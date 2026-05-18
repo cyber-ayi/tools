@@ -274,10 +274,48 @@ def copyto(src: str, dst: str, algo: str, transfers: int = 8,
     wall-clock model that credits each file's size on completion: always
     correct, no rclone cooperation required.
     """
-    args = ["copyto", "--checksum", "--transfers", str(transfers)]
+    # Hardening (#236 part 2): retry transient SMB/network errors in place
+    # instead of failing the file → full re-copy. NOT --inplace (collides
+    # with Stage C/G .partial machinery; rsync engine is the resumable
+    # -huge-file answer).
+    args = [
+        "copyto", "--checksum", "--transfers", str(transfers),
+        "--retries", "3", "--low-level-retries", "10",
+    ]
     if extra:
         args.extend(extra)
     _run(args + [src, dst], capture=False)
+
+
+def have_rsync() -> bool:
+    return shutil.which("rsync") is not None
+
+
+def rsync_copyto(src: str, dst: str) -> None:
+    """Resumable single-file copy via `rsync --append` (#236 part 1).
+
+    rclone cannot resume a file across process death; rsync `--append`
+    grows the destination in place, so a killed transfer continues from
+    the current dst length next run instead of restarting from 0.
+    `--append` (NOT `--append-verify`) by design: rmig's own post-copy
+    xxh3 dst re-hash + MHL is the single integrity gate for both engines
+    — rsync's slow whole-file md5 verify would just double the full read.
+    A bad append ⇒ hash mismatch ⇒ rmig re-copies whole = same worst case
+    as today, never worse. Caller guarantees dst is local.
+    """
+    rb = shutil.which("rsync")
+    if not rb:
+        raise RcloneError("rsync not found in PATH")
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    full = [rb, "--append", "--times", src, dst]
+    if _VERBOSE_HOOK is not None and _VERBOSE_HOOK.is_detail():
+        import shlex
+        _VERBOSE_HOOK.detail("    $ " + " ".join(shlex.quote(a) for a in full))
+    cp = subprocess.run(full, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise RcloneError(
+            f"rsync --append failed (exit {cp.returncode}):\n{cp.stderr}"
+        )
 
 
 def deletefile(path: str) -> None:

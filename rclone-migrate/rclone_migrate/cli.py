@@ -205,13 +205,18 @@ def cmd_copy(argv: Optional[List[str]] = None) -> int:
                    help="Don't remove .partial temp files orphaned by a "
                         "prior interrupted run (default: remove them — "
                         "they cannot resume and would wedge this run)")
+    p.add_argument("--no-rsync", action="store_true",
+                   help="Force rclone for every file; disable the rsync "
+                        "engine for large files (default: files ≥ "
+                        "rsync_min_size to a local dst use `rsync --append`, "
+                        "resumable across process death)")
     args = p.parse_args(argv)
     cfg, job = _load(args)
     v = _make_verbose(args)
     return ops.do_copy(
         cfg, job, no_refresh=args.no_refresh, full=args.full,
         dry_run=args.dry_run, clean_partial=not args.no_clean_partial,
-        progress=not args.quiet, v=v,
+        use_rsync=not args.no_rsync, progress=not args.quiet, v=v,
     )
 
 
