@@ -80,6 +80,51 @@ class _PartialWatch:
                 self._meter.set_inflight(best)
 
 
+def _clean_stale_partials(job: Job, to_copy, v) -> int:
+    """Stage G: remove `.partial` temp files left by a previously
+    interrupted run for the files we're about to (re)copy.
+
+    Safe by construction: do_copy runs inside audit.run which holds an
+    exclusive fcntl job lock, so no other rmig copy for this job can be
+    running — any `<dst>*.partial` for a to-copy file is therefore an
+    orphan from a dead/killed run, not a live transfer. rclone never
+    *resumes* a file copy from a `.partial` (it's an atomicity temp, not a
+    resume checkpoint; the file is re-copied whole), so removing it loses
+    no resumable progress — it only unwedges subsequent runs (#157/#212).
+    Only applies when dst is a local path; remote `.partial` is rclone's.
+    """
+    if not rclone.is_local(job.dst):
+        return 0
+    # group to-copy basenames by their dst directory; one scandir per dir
+    by_dir: dict = {}
+    for ent in to_copy:
+        dst_full = _join(job.dst, ent.path)
+        d = os.path.dirname(dst_full) or "."
+        by_dir.setdefault(d, set()).add(os.path.basename(dst_full))
+    removed = 0
+    for d, bases in by_dir.items():
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            n = e.name
+            if not n.endswith(".partial"):
+                continue
+            if any(n == b + ".partial" or n.startswith(b + ".")
+                   for b in bases):
+                try:
+                    os.remove(e.path)
+                    removed += 1
+                    v.detail(f"  [copy] removed stale partial: {n}")
+                except OSError as ex:
+                    v.warn(f"  [copy] could not remove {n}: {ex}")
+    if removed:
+        v.info(f"[copy] cleared {removed} stale .partial "
+               f"(orphaned by a prior interrupted run)")
+    return removed
+
+
 # --- helpers ---------------------------------------------------------------
 
 def _join(root: str, rel: str) -> str:
@@ -260,6 +305,7 @@ def do_copy(
     no_refresh: bool = False,
     full: bool = False,
     dry_run: bool = False,
+    clean_partial: bool = True,
     progress: bool = True,
     v: Optional[verbose_mod.Verbose] = None,
 ) -> int:
@@ -289,6 +335,12 @@ def do_copy(
             ev.set_result("ok")
             conn.close()
             return 0
+
+        # Stage G: under the job lock, clear partials orphaned by a prior
+        # interrupted run so they can't wedge this one (#157/#212). Skip
+        # for dry-run and when explicitly opted out.
+        if clean_partial and not dry_run:
+            _clean_stale_partials(job, plan.to_copy, v)
 
         failures = 0
         copied_dst_paths: List[str] = []

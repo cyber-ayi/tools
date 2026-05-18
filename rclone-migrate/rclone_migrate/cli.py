@@ -201,12 +201,17 @@ def cmd_copy(argv: Optional[List[str]] = None) -> int:
                    help="Force full re-hash before copying")
     p.add_argument("--dry-run", action="store_true",
                    help="Print what would be copied; do nothing")
+    p.add_argument("--no-clean-partial", action="store_true",
+                   help="Don't remove .partial temp files orphaned by a "
+                        "prior interrupted run (default: remove them — "
+                        "they cannot resume and would wedge this run)")
     args = p.parse_args(argv)
     cfg, job = _load(args)
     v = _make_verbose(args)
     return ops.do_copy(
         cfg, job, no_refresh=args.no_refresh, full=args.full,
-        dry_run=args.dry_run, progress=not args.quiet, v=v,
+        dry_run=args.dry_run, clean_partial=not args.no_clean_partial,
+        progress=not args.quiet, v=v,
     )
 
 
