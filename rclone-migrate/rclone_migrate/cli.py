@@ -208,7 +208,7 @@ def cmd_copy(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-rsync", action="store_true",
                    help="Force rclone for every file; disable the rsync "
                         "engine for large files (default: files ≥ "
-                        "rsync_min_size to a local dst use `rsync --append`, "
+                        "resumable_min_size to a local dst use `rsync --append`, "
                         "resumable across process death)")
     args = p.parse_args(argv)
     cfg, job = _load(args)

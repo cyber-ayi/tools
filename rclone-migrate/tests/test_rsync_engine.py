@@ -32,25 +32,25 @@ def test_parse_size():
     assert _parse_size(2048) == 2048
 
 
-def test_resolved_rsync_min_size_default_and_override():
+def test_resolved_resumable_min_size_default_and_override():
     d = Defaults()                                   # default "10GiB"
     j = Job(name="j", src="/s", dst="/d")
-    assert j.resolved_rsync_min_size(d) == 10 * 1024**3
-    j2 = Job(name="j", src="/s", dst="/d", rsync_min_size="2GiB")
-    assert j2.resolved_rsync_min_size(d) == 2 * 1024**3
-    d2 = Defaults(rsync_min_size="0")
-    assert Job(name="j", src="/s", dst="/d").resolved_rsync_min_size(d2) == 0
+    assert j.resolved_resumable_min_size(d) == 10 * 1024**3
+    j2 = Job(name="j", src="/s", dst="/d", resumable_min_size="2GiB")
+    assert j2.resolved_resumable_min_size(d) == 2 * 1024**3
+    d2 = Defaults(resumable_min_size="0")
+    assert Job(name="j", src="/s", dst="/d").resolved_resumable_min_size(d2) == 0
 
 
 # ---- engine selection matrix ----
 
 def _job(dst="/Volumes/nas/x", rms=None):
-    return Job(name="j", src="/sd/DCIM", dst=dst, rsync_min_size=rms)
+    return Job(name="j", src="/sd/DCIM", dst=dst, resumable_min_size=rms)
 
 
 def _cfg():
     class C:  # minimal cfg with .defaults
-        defaults = Defaults()  # rsync_min_size "10GiB"
+        defaults = Defaults()  # resumable_min_size "10GiB"
     return C()
 
 

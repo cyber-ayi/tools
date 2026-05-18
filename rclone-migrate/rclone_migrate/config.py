@@ -78,7 +78,7 @@ class Defaults:
     # is available, are transferred via `rsync --append` (resumable across
     # process death — rclone cannot resume a single file). Smaller files /
     # remote dst / no rsync → rclone. "0"/"off" disables (all rclone).
-    rsync_min_size: str = "10GiB"
+    resumable_min_size: str = "10GiB"
     # ASC MHL v2.0 emit: opt-in. When true, copy/check/hash ops write a
     # generation file under <root>/ascmhl/ for the relevant side(s).
     emit_mhl: bool = False
@@ -114,7 +114,7 @@ class Job:
     checkers: Optional[int] = None
     download: Optional[bool] = None
     local_cache_in_root: Optional[bool] = None
-    rsync_min_size: Optional[str] = None
+    resumable_min_size: Optional[str] = None
     emit_mhl: Optional[bool] = None
     mhl_author: Optional[str] = None
     mhl_author_phone: Optional[str] = None
@@ -148,10 +148,10 @@ class Job:
             else defaults.local_cache_in_root
         )
 
-    def resolved_rsync_min_size(self, defaults: Defaults) -> int:
+    def resolved_resumable_min_size(self, defaults: Defaults) -> int:
         """Threshold in bytes; 0 = rsync engine disabled (all rclone)."""
-        raw = (self.rsync_min_size if self.rsync_min_size is not None
-               else defaults.rsync_min_size)
+        raw = (self.resumable_min_size if self.resumable_min_size is not None
+               else defaults.resumable_min_size)
         return _parse_size(raw)
 
     def resolved_emit_mhl(self, defaults: Defaults) -> bool:
@@ -273,7 +273,7 @@ def load(path: str | Path) -> Config:
         local_cache_in_root=d.get(
             "local_cache_in_root", Defaults.local_cache_in_root,
         ),
-        rsync_min_size=str(d.get("rsync_min_size", Defaults.rsync_min_size)),
+        resumable_min_size=str(d.get("resumable_min_size", Defaults.resumable_min_size)),
         emit_mhl=bool(d.get("emit_mhl", Defaults.emit_mhl)),
         mhl_author=d.get("mhl_author"),
         mhl_author_phone=d.get("mhl_author_phone"),
@@ -314,7 +314,7 @@ def load(path: str | Path) -> Config:
                 checkers=jr.get("checkers"),
                 download=jr.get("download"),
                 local_cache_in_root=jr.get("local_cache_in_root"),
-                rsync_min_size=jr.get("rsync_min_size"),
+                resumable_min_size=jr.get("resumable_min_size"),
                 emit_mhl=jr.get("emit_mhl"),
                 mhl_author=jr.get("mhl_author"),
                 mhl_author_phone=jr.get("mhl_author_phone"),

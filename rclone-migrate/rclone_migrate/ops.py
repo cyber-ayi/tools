@@ -87,7 +87,7 @@ def _select_engine(to_copy, job, cfg, use_rsync: bool, v) -> dict:
     death) iff: rsync enabled (use_rsync and threshold>0), its size ≥
     threshold, dst is a local path/mount, and rsync is on PATH. Otherwise
     **rclone**. Returns {relpath: "rclone"|"rsync"} and logs one line."""
-    thr = job.resolved_rsync_min_size(cfg.defaults) if use_rsync else 0
+    thr = job.resolved_resumable_min_size(cfg.defaults) if use_rsync else 0
     dst_local = rclone.is_local(job.dst)
     rsync_ok = rclone.have_rsync()
     eng = {}
