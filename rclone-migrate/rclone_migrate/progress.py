@@ -95,6 +95,7 @@ class ProgressMeter:
         self._committed = 0
         self._files_done = 0
         self._current = ""
+        self._active = 0      # files between set_current() and file_done()
         self._failures = 0
 
         self._start_t = time.time()
@@ -125,8 +126,9 @@ class ProgressMeter:
         self.start()
         return self
 
-    def __exit__(self, *exc) -> None:
-        self.stop()
+    def __exit__(self, exc_type=None, *exc) -> None:
+        self.stop(interrupted=exc_type is not None
+                  and issubclass(exc_type, KeyboardInterrupt))
 
     def start(self) -> None:
         if self.live and self._thread is None:
@@ -135,14 +137,14 @@ class ProgressMeter:
             )
             self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, interrupted: bool = False) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
         if self.live:
             self._erase_line()
-        self._emit_summary()
+        self._emit_summary(interrupted=interrupted)
 
     # --- producer-side updates --------------------------------------------
 
@@ -281,19 +283,24 @@ class ProgressMeter:
             self._refresh_speed()
             self._write_live(self._format_line())
 
-    def _emit_summary(self) -> None:
+    def _emit_summary(self, interrupted: bool = False) -> None:
         elapsed = max(time.time() - self._start_t, 1e-6)
         with self._lock:
             files_done = self._files_done
             processed = self._committed
             failures = self._failures
+            total_files = self._total_files
         avg = processed / elapsed
+        verb = "interrupted" if interrupted else "done"
+        tail = f"/{total_files}" if interrupted and total_files else ""
         msg = (
-            f"{self._label} done: {files_done} files"
+            f"{self._label} {verb}: {files_done}{tail} files"
             + (f", {_human_bytes(processed)}" if processed else "")
             + f" in {elapsed:.1f}s (avg {_human_rate(avg)})"
         )
-        if failures:
+        if interrupted:
+            self._v.warn(msg)
+        elif failures:
             self._v.warn(msg + f" — {failures} failed")
         else:
             self._v.info(msg)

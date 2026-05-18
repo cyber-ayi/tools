@@ -934,13 +934,20 @@ def cmd_delete(argv: Optional[List[str]] = None) -> int:
 # expects functions that may return None; sys.exit makes both work).
 
 def _safe_exit(fn) -> int:
-    """Translate LockContention into a clean exit-3 message instead of a
-    traceback. Other exceptions still propagate."""
+    """Translate LockContention into a clean exit-3 message, and Ctrl-C into
+    a clean exit-130, instead of a traceback. Other exceptions propagate."""
     try:
         return fn()
     except audit_mod.LockContention as e:
         print(f"REFUSE: {e}", file=sys.stderr)
         return 3
+    except KeyboardInterrupt:
+        # rclone children share the tty process group and have already
+        # exited on the same SIGINT, removing their own .partial files.
+        # Completed files are committed/recorded — rerun resumes.
+        print("\nInterrupted — rerun to resume (completed files are kept).",
+              file=sys.stderr)
+        return 130
 
 
 def hash_cmd() -> None:  sys.exit(_safe_exit(cmd_hash))
@@ -967,7 +974,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     sub, rest = argv[0], argv[1:]
-    locked = {"hash", "copy", "check", "delete", "export-mhl"}
     table = {
         "hash": cmd_hash, "copy": cmd_copy, "check": cmd_check,
         "delete": cmd_delete, "list-jobs": cmd_list_jobs,
@@ -979,9 +985,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"unknown subcommand: {sub}", file=sys.stderr)
         sys.exit(2)
     fn = table[sub]
-    if sub in locked:
-        sys.exit(_safe_exit(lambda: fn(rest)))
-    sys.exit(fn(rest))
+    sys.exit(_safe_exit(lambda: fn(rest)))
 
 
 if __name__ == "__main__":

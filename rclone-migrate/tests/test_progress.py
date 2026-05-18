@@ -3,6 +3,8 @@ import hashlib
 import io
 import time
 
+import pytest
+
 from rclone_migrate import hashing, progress, verbose
 
 
@@ -128,6 +130,21 @@ def test_non_streamable_algo_still_reports_bytes(tmp_path, monkeypatch):
     # The summary's byte figure is processed bytes — only non-zero if the
     # file sizes were credited (the fix). 3×4096 = 12 KiB.
     assert "hash done: 3 files, 12.00 KiB in" in out
+
+
+def test_interrupted_summary_says_interrupted(tmp_path):
+    """A KeyboardInterrupt through the `with meter` block must report
+    'interrupted' (not a misleading 'done')."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=10, total_bytes=1000)
+    with pytest.raises(KeyboardInterrupt):
+        with m:
+            m.file_done(committed_size=100)
+            m.file_done(committed_size=100)
+            raise KeyboardInterrupt
+    err = v._err.getvalue()          # interrupted summary goes via warn()
+    assert "[copy] interrupted: 2/10 files" in err
+    assert "done:" not in v._stream.getvalue()
 
 
 def test_quiet_level_is_silent():
