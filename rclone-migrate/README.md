@@ -35,7 +35,7 @@ The installer:
 Pin a specific version:
 
 ```bash
-bash install.sh --version 0.6.0
+bash install.sh --version 0.7.0
 ```
 
 Uninstall (preserves user state in `${XDG_DATA_HOME:-~/.local/share}/rclone-migrate/`):
@@ -52,7 +52,7 @@ came from this repo's release workflow, download **both** the wheel and its
 `.sigstore.json` bundle from the [GitHub Release page][releases]:
 
 ```bash
-VERSION=0.6.0   # the release you want to verify
+VERSION=0.7.0   # the release you want to verify
 TAG="rclone-migrate-v${VERSION}"
 BASE="https://github.com/Jarvie8176/tools/releases/download/${TAG}"
 
@@ -571,7 +571,7 @@ That run motivated several of the optimizations now in the codebase:
 CLI ergonomics that came out of the post-walkthrough audit:
 
 ```bash
-rmig --version                 # 0.6.0
+rmig --version                 # 0.7.0
 rmig list-jobs -c CONFIG       # tabular dump of all jobs
 ```
 

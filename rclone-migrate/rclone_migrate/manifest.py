@@ -212,16 +212,16 @@ def _refresh_local(
         raise FileNotFoundError(f"local root does not exist: {root_path}")
 
     # Decide cache location
+    dataset_id: Optional[str] = None
     if local_cache_in_root:
         db_path = cache.cache_path_for_root(root_path, fallback_dir=fallback_dir)
     else:
-        db_path = cache.cache_path_for_root(
-            Path("/__force_fallback__"), fallback_dir=fallback_dir
+        # Out-of-root cache keyed by a stable dataset id stored in the
+        # root (mount-path independent), auto-migrating any legacy
+        # path-keyed db. See cache.resolve_fallback_db.
+        db_path, dataset_id = cache.resolve_fallback_db(
+            root_path, fallback_dir, v
         )
-        # Actually compute against the real root for fallback naming
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-        db_path = fallback_dir / f"cache-{digest}.db"
 
     # Walk directory. Skip our own sidecar dirs (.rmig-cache.db family +
     # ascmhl/ when MHL emit is on) so they don't pollute the manifest or
@@ -233,7 +233,10 @@ def _refresh_local(
         # Prune ascmhl/ at any depth (matches MHL spec's default ignore).
         dirnames[:] = [d for d in dirnames if d != "ascmhl"]
         for fn in filenames:
-            if fn.startswith(cache.CACHE_FILENAME):
+            # Exclude rmig's own root sidecars. The dataset marker in
+            # particular holds a *different* id on src vs dst — including
+            # it would make the two manifests never match.
+            if cache.is_sidecar(fn):
                 continue
             full_path = Path(dirpath) / fn
             try:
@@ -253,6 +256,19 @@ def _refresh_local(
         skipped_by_size = before - len(current)
 
     conn = cache.open_db(db_path)
+    if dataset_id is not None:
+        # Stamp the id inside the db too (cross-check): if this db file was
+        # ever bound to a different dataset, surface it rather than trust
+        # a filename collision.
+        stamped = cache.meta_get(conn, "dataset_id")
+        if stamped and stamped != dataset_id:
+            v.warn(
+                f"[cache] {db_path.name} was stamped for dataset "
+                f"{stamped} but root resolves to {dataset_id}; "
+                f"size+mtime still governs validity"
+            )
+        elif not stamped:
+            cache.meta_set(conn, "dataset_id", dataset_id)
     cached = cache.load_for_algorithm(conn, algorithm)
     # When filtering, restrict the cached map too so unrelated cached entries
     # don't show up as "removed" (they're still on disk, just out of scope).
@@ -659,9 +675,9 @@ def append_to_local_cache(
     if local_cache_in_root:
         db_path = cache.cache_path_for_root(root_path, fallback_dir=fallback)
     else:
-        fallback.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-        db_path = fallback / f"cache-{digest}.db"
+        # MUST match _refresh_local's keying or appended hashes land in a
+        # db the next refresh won't read → silent re-hash.
+        db_path, _ = cache.resolve_fallback_db(root_path, fallback)
 
     conn = cache.open_db(db_path)
     entries: List[cache.CacheEntry] = []

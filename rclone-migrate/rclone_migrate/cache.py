@@ -13,12 +13,29 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 CACHE_FILENAME = ".rmig-cache.db"
+# Stable per-dataset id, stored *in the data root* so it travels with the
+# files. The out-of-root (fallback) cache db is then keyed by this id
+# instead of the absolute mount path — so re-mounting the same physical
+# data under a different path/SMB-share reuses the cache instead of
+# orphaning it (which forced a full re-hash). One line, ~33 bytes,
+# write-once, never churns (cf. the ascmhl/ sidecar).
+MARKER_FILENAME = ".rmig-dataset"
+
+
+def is_sidecar(name: str) -> bool:
+    """True for rmig's own root sidecar files, which must be excluded from
+    the manifest/MHL walk. The dataset marker in particular differs
+    between src and dst (distinct ids) — including it would make the two
+    manifests never match."""
+    return name.startswith(CACHE_FILENAME) or name == MARKER_FILENAME
 
 
 @dataclass
@@ -74,8 +91,97 @@ def open_db(db_path: Path) -> sqlite3.Connection:
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_hash ON hash_cache(algorithm, hash)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+    )
     conn.commit()
     return conn
+
+
+def meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (key,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value)
+    )
+    conn.commit()
+
+
+def _legacy_fallback_db(root_path: Path, fallback_dir: Path) -> Path:
+    digest = hashlib.sha1(
+        str(root_path.resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return fallback_dir / f"cache-{digest}.db"
+
+
+def _dataset_id(root_path: Path, v=None) -> Optional[str]:
+    """Read (or create) <root>/.rmig-dataset. Returns the id, or None if
+    the marker can't be read/written (e.g. read-only root) — caller then
+    falls back to the legacy path-keyed db (no regression)."""
+    marker = root_path / MARKER_FILENAME
+    try:
+        if marker.is_file():
+            txt = marker.read_text(encoding="utf-8", errors="replace").strip()
+            tok = txt.split()[0] if txt else ""
+            # keep it filesystem-safe; tolerate hand-edits
+            tok = "".join(c for c in tok if c.isalnum() or c in "-_")
+            if tok:
+                return tok
+    except OSError:
+        return None
+    dsid = uuid.uuid4().hex
+    try:
+        tmp = root_path / (MARKER_FILENAME + f".tmp.{os.getpid()}")
+        tmp.write_text(dsid + "\n", encoding="utf-8")
+        os.replace(tmp, marker)
+    except OSError:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        if v is not None:
+            v.detail(f"  [cache] cannot write {marker} (read-only?) — "
+                     f"using path-keyed cache")
+        return None
+    if v is not None:
+        v.detail(f"  [cache] dataset id {dsid} → {marker}")
+    return dsid
+
+
+def resolve_fallback_db(
+    root_path: Path, fallback_dir: Path, v=None
+) -> Tuple[Path, Optional[str]]:
+    """Return (db_path, dataset_id). db is keyed by the stable dataset id
+    (mount-path independent); dataset_id is None when the marker was
+    unavailable (read-only root) and we fell back to the legacy path-keyed
+    db — unchanged v0.3.0 behaviour, no regression.
+
+    Auto-migrates a pre-existing legacy path-keyed db by *copying* it
+    (legacy kept as a rollback backup) so prior hashing work survives a
+    path/share change."""
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+    legacy = _legacy_fallback_db(root_path, fallback_dir)
+    dsid = _dataset_id(root_path, v)
+    if dsid is None:
+        return legacy, None
+    db = fallback_dir / f"cache-{dsid}.db"
+    if not db.exists() and legacy.exists():
+        try:
+            shutil.copy2(legacy, db)
+            if v is not None:
+                v.info(f"[cache] migrated {legacy.name} → {db.name} "
+                       f"(legacy kept as backup)")
+        except OSError as e:
+            if v is not None:
+                v.warn(f"[cache] migrate {legacy.name} failed ({e}); "
+                       f"will rebuild")
+    return db, dsid
 
 
 def load_for_algorithm(conn: sqlite3.Connection, algorithm: str) -> Dict[str, CacheEntry]:

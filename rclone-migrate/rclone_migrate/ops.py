@@ -580,9 +580,7 @@ def _do_delete_inner(cfg, job, *, confirm, progress, ev, v):
         if in_root:
             db_path = cache_mod.cache_path_for_root(root_path, fallback_dir=fallback)
         else:
-            import hashlib as _hl
-            digest = _hl.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-            db_path = fallback / f"cache-{digest}.db"
+            db_path, _ = cache_mod.resolve_fallback_db(root_path, fallback)
         if db_path.exists():
             cc = cache_mod.open_db(db_path)
             cache_mod.delete_paths(cc, deleted_paths)
