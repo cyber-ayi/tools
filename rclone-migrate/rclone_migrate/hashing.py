@@ -27,6 +27,31 @@ PREFERRED_ORDER: List[str] = [
 # Hashes that Python's hashlib can compute locally without invoking rclone.
 HASHLIB_SUPPORTED = {"md5", "sha1", "sha256", "sha512"}
 
+# Streaming xxhash-family support via the optional `xxhash` package
+# (install extra: rclone-migrate[xxhash]). hexdigests verified
+# byte-identical to rclone's output: rclone "xxh3" == xxh3_64,
+# "xxh128" == xxh3_128. "xxh64" has no rclone equivalent (rclone speaks
+# xxh3/xxh128 only) so it *requires* this path.
+try:  # pragma: no cover - import guard
+    import xxhash as _xxhash
+
+    _XXHASH_CTORS = {
+        "xxh3": _xxhash.xxh3_64,
+        "xxh128": _xxhash.xxh3_128,
+        "xxh64": _xxhash.xxh64,
+    }
+except ImportError:  # pragma: no cover
+    _xxhash = None
+    _XXHASH_CTORS = {}
+
+
+def can_stream_local(algo: str) -> bool:
+    """True iff ``hash_file_local`` computes ``algo`` in-process with a
+    chunk loop (so ``progress_cb`` fires per chunk). False means it shells
+    out to a per-file ``rclone hashsum`` subprocess with no intra-file
+    progress — callers should then meter at file granularity instead."""
+    return algo in HASHLIB_SUPPORTED or algo in _XXHASH_CTORS
+
 
 class HashNegotiationError(RuntimeError):
     pass
@@ -104,13 +129,19 @@ def hash_file_local(
     """
     if algo in HASHLIB_SUPPORTED:
         h = hashlib.new(algo)
+    elif algo in _XXHASH_CTORS:
+        h = _XXHASH_CTORS[algo]()
+    else:
+        h = None
+    if h is not None:
         with open(path, "rb") as f:
             while chunk := f.read(chunk_size):
                 h.update(chunk)
                 if progress_cb is not None:
                     progress_cb(len(chunk))
         return h.hexdigest()
-    # Fallback to rclone for exotic algorithms
+    # No local streaming impl (e.g. crc32/blake3/quickxor without a lib):
+    # fall back to a per-file rclone hashsum subprocess.
     result = rclone.hashsum_file(algo, path)
     if result is None:
         raise HashNegotiationError(

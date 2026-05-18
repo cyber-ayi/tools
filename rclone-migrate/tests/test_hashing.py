@@ -1,4 +1,5 @@
 import hashlib
+import shutil
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +26,51 @@ def test_hash_file_local_sha256(tmp_path: Path):
     f.write_bytes(b"hello world")
     expected = hashlib.sha256(b"hello world").hexdigest()
     assert hashing.hash_file_local(str(f), "sha256") == expected
+
+
+xxhash = pytest.importorskip("xxhash")
+
+
+def test_can_stream_local_truth_table():
+    for a in ("md5", "sha1", "sha256", "sha512", "xxh3", "xxh128", "xxh64"):
+        assert hashing.can_stream_local(a) is True
+    for a in ("crc32", "blake3", "quickxor", "whirlpool"):
+        assert hashing.can_stream_local(a) is False
+
+
+def test_hash_file_local_xxhash_streams_and_matches_oneshot(tmp_path: Path):
+    data = b"".join(bytes([i % 256]) for i in range(300_000)) + b"end"
+    f = tmp_path / "x.bin"
+    f.write_bytes(data)
+    cases = {
+        "xxh3": xxhash.xxh3_64(data).hexdigest(),
+        "xxh128": xxhash.xxh3_128(data).hexdigest(),
+        "xxh64": xxhash.xxh64(data).hexdigest(),
+    }
+    for algo, expected in cases.items():
+        seen = []
+        got = hashing.hash_file_local(
+            str(f), algo, chunk_size=64 * 1024, progress_cb=seen.append
+        )
+        assert got == expected, algo
+        assert sum(seen) == len(data)        # progress_cb fired per chunk
+        assert len(seen) >= 4
+
+
+@pytest.mark.skipif(shutil.which("rclone") is None, reason="rclone not installed")
+def test_xxhash_digest_byte_identical_to_rclone(tmp_path: Path):
+    """Critical: a manifest hashed in-process must match a side hashed by
+    rclone, or check/copy would see false 'missing' files."""
+    import subprocess
+
+    f = tmp_path / "blob.bin"
+    f.write_bytes(b"rclone-parity-check" * 9999)
+    for algo in ("xxh3", "xxh128"):
+        out = subprocess.run(
+            ["rclone", "hashsum", algo, str(f)],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()[0]
+        assert hashing.hash_file_local(str(f), algo) == out, algo
 
 
 def test_negotiate_picks_strongest_common(monkeypatch):
