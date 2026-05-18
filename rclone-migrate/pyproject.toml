@@ -1,6 +1,6 @@
 [project]
 name = "rclone-migrate"
-version = "0.1.0"
+version = "0.2.0"
 description = "Safe rclone migration with copy → check → delete and persisted checksums"
 requires-python = ">=3.9"
 dependencies = [
