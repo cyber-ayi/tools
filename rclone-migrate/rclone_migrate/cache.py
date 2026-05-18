@@ -66,7 +66,10 @@ def cache_path_for_root(root: Path, fallback_dir: Optional[Path] = None) -> Path
         # No fallback configured — caller will fail later when trying to write
         return primary
     fallback_dir.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha1(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
+    # not security: just a stable filename digest of the root path
+    digest = hashlib.sha1(
+        str(root.resolve()).encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:16]
     return fallback_dir / f"cache-{digest}.db"
 
 
@@ -119,8 +122,9 @@ def meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _legacy_fallback_db(root_path: Path, fallback_dir: Path) -> Path:
+    # not security: just a stable filename digest of the root path
     digest = hashlib.sha1(
-        str(root_path.resolve()).encode("utf-8")
+        str(root_path.resolve()).encode("utf-8"), usedforsecurity=False
     ).hexdigest()[:16]
     return fallback_dir / f"cache-{digest}.db"
 

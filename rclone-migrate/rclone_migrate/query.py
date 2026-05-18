@@ -65,7 +65,10 @@ def _open_local_cache_for_side(
         db_path = cache_mod.cache_path_for_root(root_path, fallback_dir=fallback)
     else:
         fallback.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
+        # not security: just a stable filename digest of the root path
+        digest = hashlib.sha1(
+            str(root_path.resolve()).encode("utf-8"), usedforsecurity=False
+        ).hexdigest()[:16]
         db_path = fallback / f"cache-{digest}.db"
     if not db_path.exists():
         return None
