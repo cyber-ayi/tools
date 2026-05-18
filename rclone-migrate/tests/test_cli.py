@@ -10,6 +10,23 @@ from rclone_migrate import __version__
 from rclone_migrate import cli
 
 
+def test_safe_exit_keyboardinterrupt_is_clean(capsys):
+    """Ctrl-C must yield exit 130 + a one-line message, not a traceback."""
+    def boom():
+        raise KeyboardInterrupt
+
+    rc = cli._safe_exit(boom)
+    assert rc == 130
+    err = capsys.readouterr().err
+    assert "Interrupted" in err
+    assert "Traceback" not in err
+
+
+def test_safe_exit_passes_through_normal_return():
+    assert cli._safe_exit(lambda: 0) == 0
+    assert cli._safe_exit(lambda: 7) == 7
+
+
 def _write_config(path: Path) -> None:
     path.write_text(
         "[defaults]\nhash = 'SHA256'\n"

@@ -58,15 +58,12 @@ def _human_eta(seconds: float) -> str:
 class ProgressMeter:
     """A thread-safe progress accumulator with an optional 1Hz live line.
 
-    Byte model:
-      * ``committed`` — bytes fully accounted for (finished files, or
-        cumulative chunk progress for local hashing).
-      * ``inflight``  — bytes of the file currently in flight (set absolutely
-        from rclone's JSON stats during copy). Reset on ``file_done``.
-
-    Speed is taken from ``set_inflight``'s ``speed`` argument when provided
-    (rclone reports a real transfer rate); otherwise it is computed from the
-    processed-byte delta between 1s samples with light EMA smoothing.
+    Bytes are accumulated as ``committed`` — either streamed in via
+    ``add_processed`` (local hashlib/xxhash chunk callbacks) or credited
+    per file on ``file_done`` (remote hash, copy). Speed is either a
+    windowed EMA of the processed-byte delta between samples, or, when
+    ``cumulative=True``, simply committed / wall-elapsed (honest for
+    phases whose bytes only land at file-completion granularity).
     """
 
     _SMOOTH = 0.4  # EMA weight for self-computed speed
@@ -96,11 +93,25 @@ class ProgressMeter:
 
         self._lock = threading.Lock()
         self._committed = 0
-        self._inflight = 0
+        self._inflight = 0    # current in-flight file bytes (copy .partial
+                              # watch); display-only — speed stays committed-
+                              # based so it can't be inflated. 0 ⇒ no watch
+                              # (graceful degrade to wall-clock behaviour).
         self._files_done = 0
-        self._ext_speed: Optional[float] = None
         self._current = ""
+        self._active = 0      # files between set_current() and file_done()
         self._failures = 0
+
+        # Multi-worker mode (parallel hashing): one render line per worker
+        # slot + the aggregate line. Activated lazily the first time
+        # worker_slot() is called; single-stream callers (copy, remote
+        # streaming) never touch it and keep the classic one-line render.
+        self._multiline = False
+        self._slots: dict = {}            # wid -> {path,size,bytes}
+        self._slot_of_thread: dict = {}   # thread ident -> wid
+        self._nslots = 0                  # max distinct wids seen
+        self._max_worker_lines = 12
+        self._block_h = 0                 # lines currently drawn in the block
 
         self._start_t = time.time()
         self._last_sample_t = self._start_t
@@ -130,8 +141,9 @@ class ProgressMeter:
         self.start()
         return self
 
-    def __exit__(self, *exc) -> None:
-        self.stop()
+    def __exit__(self, exc_type=None, *exc) -> None:
+        self.stop(interrupted=exc_type is not None
+                  and issubclass(exc_type, KeyboardInterrupt))
 
     def start(self) -> None:
         if self.live and self._thread is None:
@@ -140,14 +152,17 @@ class ProgressMeter:
             )
             self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, interrupted: bool = False) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
         if self.live:
-            self._erase_line()
-        self._emit_summary()
+            if self._multiline:
+                self._erase_block()
+            else:
+                self._erase_line()
+        self._emit_summary(interrupted=interrupted)
 
     # --- producer-side updates --------------------------------------------
 
@@ -156,24 +171,26 @@ class ProgressMeter:
             self._current = path
 
     def add_processed(self, nbytes: int) -> None:
-        """Incremental bytes processed (local hash chunks)."""
+        """Incremental bytes processed (local hashlib/xxhash chunks)."""
         with self._lock:
             self._committed += nbytes
 
-    def set_inflight(self, nbytes: int, speed: Optional[float] = None) -> None:
-        """Absolute bytes transferred for the current file (rclone stats)."""
+    def set_inflight(self, nbytes: int) -> None:
+        """Absolute byte size of the current in-flight file, sampled from
+        rclone's on-disk ``.partial`` (copy). Display-only: makes the bar
+        advance within a large file without touching the committed-based
+        speed. If the watcher finds nothing this stays 0 and the meter
+        behaves exactly like the wall-clock model."""
         with self._lock:
-            self._inflight = nbytes
-            if speed is not None and speed >= 0:
-                self._ext_speed = speed
+            self._inflight = max(0, nbytes)
 
     def file_done(self, committed_size: Optional[int] = None,
                    ok: bool = True) -> None:
         """Mark one file finished.
 
         ``committed_size`` is added to the committed total for byte-unaware
-        callers (remote hash, copy). Local hashing passes ``None`` because the
-        bytes were already streamed in via :meth:`add_processed`.
+        callers (remote hash, copy). Streaming local hashing passes ``None``
+        because the bytes already arrived via :meth:`add_processed`.
         """
         with self._lock:
             self._files_done += 1
@@ -182,7 +199,48 @@ class ProgressMeter:
             if committed_size is not None and committed_size >= 0:
                 self._committed += committed_size
             self._inflight = 0
-            self._ext_speed = None
+        if not self.live:
+            self._maybe_periodic()
+
+    # --- per-worker (parallel hash) ---------------------------------------
+
+    def worker_slot(self) -> int:
+        """Stable small slot id for the calling thread (ThreadPoolExecutor
+        reuses threads, so a thread keeps its slot for the whole phase).
+        First call switches the meter into multi-line mode."""
+        tid = threading.get_ident()
+        with self._lock:
+            wid = self._slot_of_thread.get(tid)
+            if wid is None:
+                wid = len(self._slot_of_thread)
+                self._slot_of_thread[tid] = wid
+                self._nslots = max(self._nslots, wid + 1)
+            self._multiline = True
+            return wid
+
+    def worker_start(self, wid: int, path: str, size: Optional[int] = None) -> None:
+        with self._lock:
+            self._slots[wid] = {"path": path, "size": size or 0, "bytes": 0}
+            self._current = path
+
+    def worker_add(self, wid: int, nbytes: int) -> None:
+        """Per-chunk bytes for a worker's in-flight file (streamed hash).
+        Also feeds the aggregate."""
+        with self._lock:
+            s = self._slots.get(wid)
+            if s is not None:
+                s["bytes"] += nbytes
+            self._committed += nbytes
+
+    def worker_done(self, wid: int, committed_size: Optional[int] = None,
+                    ok: bool = True) -> None:
+        with self._lock:
+            self._files_done += 1
+            if not ok:
+                self._failures += 1
+            if committed_size is not None and committed_size >= 0:
+                self._committed += committed_size
+            self._slots.pop(wid, None)
         if not self.live:
             self._maybe_periodic()
 
@@ -216,12 +274,11 @@ class ProgressMeter:
         with self._lock:
             files_done = self._files_done
             processed = self._processed()
-            ext_speed = self._ext_speed
             current = self._current
             failures = self._failures
             total_files = self._total_files
             total_bytes = self._total_bytes
-        speed = ext_speed if ext_speed is not None else self._speed
+        speed = self._speed
 
         parts = [self._label]
         if total_files:
@@ -233,7 +290,8 @@ class ProgressMeter:
             pct = 100.0 * processed / total_bytes
             parts.append(
                 f"{_human_bytes(processed)}/{_human_bytes(total_bytes)} "
-                f"({pct:.0f}%)"
+                f"({pct:.2f}%)"  # 2 decimals: a 226 GiB job spends a long
+                                 # time under 1% — integer % reads "0%"
             )
         elif processed:
             parts.append(_human_bytes(processed))
@@ -254,6 +312,63 @@ class ProgressMeter:
                 disp = current if len(current) <= budget else "…" + current[-(budget - 1):]
                 line += f"  cur: {disp}"
         return line
+
+    def _format_worker_lines(self) -> list:
+        with self._lock:
+            nslots = self._nslots
+            slots = {k: dict(v) for k, v in self._slots.items()}
+        out = []
+        shown = min(nslots, self._max_worker_lines)
+        for wid in range(shown):
+            s = slots.get(wid)
+            if s is None:
+                out.append(f"  · w{wid}  idle")
+                continue
+            size = s["size"]
+            b = s["bytes"]
+            pct = f"{100.0*b/size:3.0f}%" if size else "  ? "
+            path = s["path"]
+            stem = f"{_human_bytes(b)}/{_human_bytes(size)}" if size else _human_bytes(b)
+            head = f"  ▸ w{wid}  {pct}  {stem}  "
+            budget = 110 - len(head)
+            disp = path if len(path) <= budget else "…" + path[-(budget - 1):]
+            out.append(head + disp)
+        if nslots > shown:
+            out.append(f"  … +{nslots - shown} more workers")
+        return out
+
+    def _write_block(self) -> None:
+        if self._term is None:
+            return
+        worker_lines = self._format_worker_lines()
+        agg = self._format_line()
+        if self._color:
+            agg = verbose_mod.CYAN + agg + verbose_mod.RESET
+        lines = worker_lines + [agg]
+        h = len(lines)
+        try:
+            if self._block_h == 0:
+                self._term.write("\n".join(lines) + "\n")
+            else:
+                # grew? reserve the extra rows first
+                if h > self._block_h:
+                    self._term.write("\n" * (h - self._block_h))
+                self._term.write(f"\033[{max(h, self._block_h)}F")
+                self._term.write("".join("\033[2K" + ln + "\n" for ln in lines))
+            self._term.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        self._block_h = h
+
+    def _erase_block(self) -> None:
+        if self._term is None or self._block_h == 0:
+            return
+        try:
+            self._term.write(f"\033[{self._block_h}F\033[0J")
+            self._term.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        self._block_h = 0
 
     def _write_live(self, line: str) -> None:
         if self._term is None:
@@ -294,21 +409,29 @@ class ProgressMeter:
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             self._refresh_speed()
-            self._write_live(self._format_line())
+            if self._multiline:
+                self._write_block()
+            else:
+                self._write_live(self._format_line())
 
-    def _emit_summary(self) -> None:
+    def _emit_summary(self, interrupted: bool = False) -> None:
         elapsed = max(time.time() - self._start_t, 1e-6)
         with self._lock:
             files_done = self._files_done
-            processed = self._committed  # inflight is 0 after stop
+            processed = self._committed
             failures = self._failures
+            total_files = self._total_files
         avg = processed / elapsed
+        verb = "interrupted" if interrupted else "done"
+        tail = f"/{total_files}" if interrupted and total_files else ""
         msg = (
-            f"{self._label} done: {files_done} files"
+            f"{self._label} {verb}: {files_done}{tail} files"
             + (f", {_human_bytes(processed)}" if processed else "")
             + f" in {elapsed:.1f}s (avg {_human_rate(avg)})"
         )
-        if failures:
+        if interrupted:
+            self._v.warn(msg)
+        elif failures:
             self._v.warn(msg + f" — {failures} failed")
         else:
             self._v.info(msg)

@@ -14,12 +14,13 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import shlex
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from . import cache, hashing, rclone, state
@@ -81,6 +82,52 @@ class Manifest:
             h.update(hh.encode("ascii"))
             h.update(b"\n")
         return h.hexdigest()
+
+
+class UnreachableRootError(RuntimeError):
+    """A src/dst local root did not respond to a stat within the probe
+    timeout — almost always a stale/dead network mount. Raised *instead of*
+    blocking forever in an uninterruptible smbfs/nfs syscall (which even
+    Ctrl-C can't break until the kernel mount times out)."""
+
+
+# Stage D: a dead SMB/NFS mount makes Path.exists()/os.walk() block in an
+# uninterruptible kernel syscall on the main thread. Probe reachability
+# from a daemon thread first and fail fast with a clear message.
+ROOT_PROBE_TIMEOUT = 10.0  # seconds; override via $RMIG_ROOT_PROBE_TIMEOUT
+
+
+def _probe_reachable(root_path: Path, side: str,
+                     v: "verbose_mod.Verbose") -> None:
+    try:
+        timeout = float(os.environ.get("RMIG_ROOT_PROBE_TIMEOUT",
+                                       ROOT_PROBE_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = ROOT_PROBE_TIMEOUT
+    if timeout <= 0:
+        return  # explicitly disabled
+    done = Event()
+
+    def _probe() -> None:
+        try:
+            os.stat(root_path)   # ENOENT/EACCES return fast → normal flow
+        except OSError:
+            pass
+        finally:
+            done.set()
+
+    # daemon: if it wedges in D-state on a dead mount we still return and
+    # raise; the leaked thread can't be joined but the process can exit.
+    Thread(target=_probe, name="rmig-root-probe", daemon=True).start()
+    if not done.wait(timeout):
+        raise UnreachableRootError(
+            f"{side} root did not respond within {timeout:.0f}s: "
+            f"{root_path}\n"
+            f"  Likely a stale/dead network mount. Verify it is alive:\n"
+            f"    time ls {shlex.quote(str(root_path))}\n"
+            f"  then remount it (or fix the job's {side} path) and retry."
+        )
+    v.detail(f"  [{side}] root reachable: {root_path}")
 
 
 # ----------------- Refresh strategies -----------------
@@ -160,30 +207,43 @@ def _refresh_local(
     if v is None:
         v = verbose_mod.default()
     root_path = Path(os.path.expanduser(root))
+    _probe_reachable(root_path, side, v)  # fail fast on dead mounts
     if not root_path.exists():
         raise FileNotFoundError(f"local root does not exist: {root_path}")
 
     # Decide cache location
+    dataset_id: Optional[str] = None
     if local_cache_in_root:
         db_path = cache.cache_path_for_root(root_path, fallback_dir=fallback_dir)
     else:
-        db_path = cache.cache_path_for_root(
-            Path("/__force_fallback__"), fallback_dir=fallback_dir
+        # Out-of-root cache keyed by a stable dataset id stored in the
+        # root (mount-path independent), auto-migrating any legacy
+        # path-keyed db. See cache.resolve_fallback_db.
+        db_path, dataset_id = cache.resolve_fallback_db(
+            root_path, fallback_dir, v
         )
-        # Actually compute against the real root for fallback naming
-        fallback_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-        db_path = fallback_dir / f"cache-{digest}.db"
 
     # Walk directory. Skip our own sidecar dirs (.rmig-cache.db family +
     # ascmhl/ when MHL emit is on) so they don't pollute the manifest or
     # become candidates for hashing.
+    if progress:
+        v.info(f"[{side}] scanning {root} …")  # walk can be slow over SMB
     current: Dict[str, Tuple[int, float]] = {}
     for dirpath, dirnames, filenames in os.walk(root_path):
         # Prune ascmhl/ at any depth (matches MHL spec's default ignore).
         dirnames[:] = [d for d in dirnames if d != "ascmhl"]
         for fn in filenames:
-            if fn.startswith(cache.CACHE_FILENAME):
+            # Exclude rmig's own root sidecars. The dataset marker in
+            # particular holds a *different* id on src vs dst — including
+            # it would make the two manifests never match.
+            if cache.is_sidecar(fn):
+                continue
+            # Exclude rclone's in-flight/leftover temp files. A `.partial`
+            # is an incomplete copy (often huge), never real data — hashing
+            # it wastes time and pollutes the manifest/MHL. refresh runs
+            # before copy's stale-partial cleanup (Stage G), so this guard
+            # is what actually keeps a leftover out of the manifest.
+            if fn.endswith(".partial"):
                 continue
             full_path = Path(dirpath) / fn
             try:
@@ -203,6 +263,19 @@ def _refresh_local(
         skipped_by_size = before - len(current)
 
     conn = cache.open_db(db_path)
+    if dataset_id is not None:
+        # Stamp the id inside the db too (cross-check): if this db file was
+        # ever bound to a different dataset, surface it rather than trust
+        # a filename collision.
+        stamped = cache.meta_get(conn, "dataset_id")
+        if stamped and stamped != dataset_id:
+            v.warn(
+                f"[cache] {db_path.name} was stamped for dataset "
+                f"{stamped} but root resolves to {dataset_id}; "
+                f"size+mtime still governs validity"
+            )
+        elif not stamped:
+            cache.meta_set(conn, "dataset_id", dataset_id)
     cached = cache.load_for_algorithm(conn, algorithm)
     # When filtering, restrict the cached map too so unrelated cached entries
     # don't show up as "removed" (they're still on disk, just out of scope).
@@ -258,19 +331,22 @@ def _refresh_local(
 
     def hash_one(rel: str) -> None:
         full_path = root_path / rel
+        wid = meter.worker_slot()
         t0 = time.time()
         try:
             st = full_path.stat()
-            meter.set_current(rel)
+            meter.worker_start(wid, rel, st.st_size)
             h = hashing.hash_file_local(
                 str(full_path), algorithm,
-                progress_cb=(meter.add_processed if streamed else None),
+                progress_cb=(
+                    (lambda n: meter.worker_add(wid, n)) if streamed else None
+                ),
             )
         except (OSError, IOError) as e:
             with new_lock:
                 failures.append((rel, repr(e)))
             v.detail(f"    FAIL {rel}: {e}")
-            meter.file_done(ok=False)
+            meter.worker_done(wid, ok=False)
             return
         with new_lock:
             entry = cache.CacheEntry(
@@ -279,14 +355,15 @@ def _refresh_local(
             )
             new_entries.append(entry)
             pending_flush.append(entry)
-        meter.file_done(committed_size=None if streamed else st.st_size)
+        meter.worker_done(wid, committed_size=None if streamed else st.st_size)
         v.detail(f"    {rel}  {h}  ({time.time() - t0:.1f}s, {st.st_size:,}B)")
 
     if to_hash:
         if progress:
             v.info(f"[{side}] hashing {len(to_hash)} files with {transfers} threads...")
         with (meter if progress else contextlib.nullcontext()):
-            with ThreadPoolExecutor(max_workers=transfers) as pool:
+            pool = ThreadPoolExecutor(max_workers=transfers)
+            try:
                 futs = [pool.submit(hash_one, p) for p in to_hash]
                 for fu in as_completed(futs):
                     fu.result()  # hash_one swallows file errors; this raises only on bugs
@@ -296,6 +373,15 @@ def _refresh_local(
                             cache.upsert_many(conn, pending_flush, refreshed=time.time())
                             v.debug(f"    [flush] {len(pending_flush)} rows → {db_path.name}")
                             pending_flush.clear()
+            except KeyboardInterrupt:
+                # Stage B: cancel not-yet-started workers immediately so
+                # Ctrl-C is prompt (in-flight files still finish — a single
+                # C-level hash update can't be preempted). Persist whatever
+                # completed below before re-raising.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                pool.shutdown(wait=True)
 
     now = time.time()
     cache.upsert_many(conn, pending_flush, refreshed=now)
@@ -596,9 +682,9 @@ def append_to_local_cache(
     if local_cache_in_root:
         db_path = cache.cache_path_for_root(root_path, fallback_dir=fallback)
     else:
-        fallback.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-        db_path = fallback / f"cache-{digest}.db"
+        # MUST match _refresh_local's keying or appended hashes land in a
+        # db the next refresh won't read → silent re-hash.
+        db_path, _ = cache.resolve_fallback_db(root_path, fallback)
 
     conn = cache.open_db(db_path)
     entries: List[cache.CacheEntry] = []

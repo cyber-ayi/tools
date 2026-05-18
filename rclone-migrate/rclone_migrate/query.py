@@ -10,7 +10,6 @@ read-only on the existing snapshots. To force a fresh re-hash, run
 """
 from __future__ import annotations
 
-import hashlib
 import os
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -64,9 +63,13 @@ def _open_local_cache_for_side(
     if in_root:
         db_path = cache_mod.cache_path_for_root(root_path, fallback_dir=fallback)
     else:
-        fallback.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-        db_path = fallback / f"cache-{digest}.db"
+        # Same db the refresh/copy/delete paths use — but read-only:
+        # create=False never writes the .rmig-dataset marker nor migrates
+        # (file-status must not mutate the data root). Resolves to the
+        # id-db when the marker exists, else the legacy path-keyed db.
+        db_path, _ = cache_mod.resolve_fallback_db(
+            root_path, fallback, create=False
+        )
     if not db_path.exists():
         return None
     return cache_mod.open_db(db_path)

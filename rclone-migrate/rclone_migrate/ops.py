@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,111 @@ from . import audit, hashing, manifest, mhl, rclone, state
 from . import progress as progress_mod
 from . import verbose as verbose_mod
 from .config import Config, Job
+
+
+# --- copy intra-file progress (Stage C) ------------------------------------
+
+class _PartialWatch:
+    """Stage C: while a single `rclone copyto` runs, poll its on-disk
+    partial file so the copy meter advances *within* a large file.
+
+    rclone's local backend streams to `<dst>.<hex>.partial` (size grows
+    incrementally — verified) then renames. We sample the largest matching
+    `<basename>*.partial` (or the final file) in the dst dir ~2.5×/s and
+    feed it to `meter.set_inflight`. Watcher is deliberately best-effort:
+    if nothing matches (rclone --inplace, an SMB mount that hides the
+    growing size, a missing dir) inflight stays 0 and the meter silently
+    behaves exactly like the wall-clock model — no warning, no special
+    casing of mount type.
+    """
+
+    def __init__(self, dst_full: str, meter, interval: float = 0.4):
+        self._dir = os.path.dirname(dst_full) or "."
+        self._base = os.path.basename(dst_full)
+        self._meter = meter
+        self._interval = interval
+        self._stop = threading.Event()
+        self._t: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "_PartialWatch":
+        self._t = threading.Thread(
+            target=self._run, name="rmig-partial-watch", daemon=True
+        )
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._stop.set()
+        if self._t is not None:
+            self._t.join(timeout=1.5)
+        return False
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            best = 0
+            try:
+                with os.scandir(self._dir) as it:
+                    for e in it:
+                        n = e.name
+                        if n == self._base or (
+                            n.startswith(self._base) and n.endswith(".partial")
+                        ):
+                            try:
+                                best = max(
+                                    best,
+                                    e.stat(follow_symlinks=False).st_size,
+                                )
+                            except OSError:
+                                pass
+            except OSError:
+                continue  # dir not created yet / transient
+            if best:
+                self._meter.set_inflight(best)
+
+
+def _clean_stale_partials(job: Job, to_copy, v) -> int:
+    """Stage G: remove `.partial` temp files left by a previously
+    interrupted run for the files we're about to (re)copy.
+
+    Safe by construction: do_copy runs inside audit.run which holds an
+    exclusive fcntl job lock, so no other rmig copy for this job can be
+    running — any `<dst>*.partial` for a to-copy file is therefore an
+    orphan from a dead/killed run, not a live transfer. rclone never
+    *resumes* a file copy from a `.partial` (it's an atomicity temp, not a
+    resume checkpoint; the file is re-copied whole), so removing it loses
+    no resumable progress — it only unwedges subsequent runs (#157/#212).
+    Only applies when dst is a local path; remote `.partial` is rclone's.
+    """
+    if not rclone.is_local(job.dst):
+        return 0
+    # group to-copy basenames by their dst directory; one scandir per dir
+    by_dir: dict = {}
+    for ent in to_copy:
+        dst_full = _join(job.dst, ent.path)
+        d = os.path.dirname(dst_full) or "."
+        by_dir.setdefault(d, set()).add(os.path.basename(dst_full))
+    removed = 0
+    for d, bases in by_dir.items():
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            n = e.name
+            if not n.endswith(".partial"):
+                continue
+            if any(n == b + ".partial" or n.startswith(b + ".")
+                   for b in bases):
+                try:
+                    os.remove(e.path)
+                    removed += 1
+                    v.detail(f"  [copy] removed stale partial: {n}")
+                except OSError as ex:
+                    v.warn(f"  [copy] could not remove {n}: {ex}")
+    if removed:
+        v.info(f"[copy] cleared {removed} stale .partial "
+               f"(orphaned by a prior interrupted run)")
+    return removed
 
 
 # --- helpers ---------------------------------------------------------------
@@ -199,6 +305,7 @@ def do_copy(
     no_refresh: bool = False,
     full: bool = False,
     dry_run: bool = False,
+    clean_partial: bool = True,
     progress: bool = True,
     v: Optional[verbose_mod.Verbose] = None,
 ) -> int:
@@ -229,6 +336,12 @@ def do_copy(
             conn.close()
             return 0
 
+        # Stage G: under the job lock, clear partials orphaned by a prior
+        # interrupted run so they can't wedge this one (#157/#212). Skip
+        # for dry-run and when explicitly opted out.
+        if clean_partial and not dry_run:
+            _clean_stale_partials(job, plan.to_copy, v)
+
         failures = 0
         copied_dst_paths: List[str] = []
         transfers = job.resolved_transfers(cfg.defaults)
@@ -241,8 +354,14 @@ def do_copy(
             total_files=len(plan.to_copy),
             total_bytes=sum(max(e.size, 0) for e in plan.to_copy),
             periodic=False,  # per-file v.info lines below already log progress
-            # speed/ETA come live from rclone's rc core/stats (see
-            # rclone.copyto on_stats); no wall-clock fallback needed.
+            # Stage H: windowed EMA (not cumulative). Stage C's .partial
+            # watcher feeds continuous inflight bytes, so processed
+            # (committed+inflight) grows smoothly within a large file →
+            # real instantaneous speed + ETA mid-file instead of "--"
+            # until completion. If the watcher finds nothing (rclone
+            # --inplace / a mount that hides the growing size) processed
+            # only jumps at file_done → windowed degrades to per-file
+            # spikes — acceptable rare fallback, no longer the common path.
         )
         live_copy = progress and not dry_run
         with v.phase(f"copy {len(plan.to_copy)} files"), (
@@ -259,11 +378,12 @@ def do_copy(
                     meter.set_current(ent.path)
                 v.detail(f"    rclone copyto {src_full} {dst_full}")
                 try:
-                    rclone.copyto(
-                        src_full, dst_full, algo, transfers=transfers,
-                        extra=extra,
-                        on_stats=(meter.set_inflight if live_copy else None),
-                    )
+                    with (_PartialWatch(dst_full, meter)
+                          if live_copy else contextlib.nullcontext()):
+                        rclone.copyto(
+                            src_full, dst_full, algo, transfers=transfers,
+                            extra=extra,
+                        )
                     copied_dst_paths.append(ent.path)
                     meter.file_done(committed_size=max(ent.size, 0))
                     ev.record_file("dst", ent.path, outcome="copied", hash=ent.hash)
@@ -517,9 +637,7 @@ def _do_delete_inner(cfg, job, *, confirm, progress, ev, v):
         if in_root:
             db_path = cache_mod.cache_path_for_root(root_path, fallback_dir=fallback)
         else:
-            import hashlib as _hl
-            digest = _hl.sha1(str(root_path.resolve()).encode("utf-8")).hexdigest()[:16]
-            db_path = fallback / f"cache-{digest}.db"
+            db_path, _ = cache_mod.resolve_fallback_db(root_path, fallback)
         if db_path.exists():
             cc = cache_mod.open_db(db_path)
             cache_mod.delete_paths(cc, deleted_paths)

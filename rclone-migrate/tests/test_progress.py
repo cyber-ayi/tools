@@ -3,6 +3,8 @@ import hashlib
 import io
 import time
 
+import pytest
+
 from rclone_migrate import hashing, progress, verbose
 
 
@@ -128,6 +130,128 @@ def test_non_streamable_algo_still_reports_bytes(tmp_path, monkeypatch):
     # The summary's byte figure is processed bytes — only non-zero if the
     # file sizes were credited (the fix). 3×4096 = 12 KiB.
     assert "hash done: 3 files, 12.00 KiB in" in out
+
+
+def test_interrupted_summary_says_interrupted(tmp_path):
+    """A KeyboardInterrupt through the `with meter` block must report
+    'interrupted' (not a misleading 'done')."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=10, total_bytes=1000)
+    with pytest.raises(KeyboardInterrupt):
+        with m:
+            m.file_done(committed_size=100)
+            m.file_done(committed_size=100)
+            raise KeyboardInterrupt
+    err = v._err.getvalue()          # interrupted summary goes via warn()
+    assert "[copy] interrupted: 2/10 files" in err
+    assert "done:" not in v._stream.getvalue()
+
+
+def test_worker_api_aggregates_and_multiline_mode():
+    v = _v()
+    m = progress.ProgressMeter(v, "[src] hash", total_files=3,
+                               total_bytes=300)
+    assert m._multiline is False
+    w0 = m.worker_slot()
+    assert m._multiline is True
+    m.worker_start(w0, "a.bin", 100)
+    m.worker_add(w0, 60)
+    # second "thread": monkey a distinct ident by calling from this thread
+    # again returns same slot (thread-stable); simulate a 2nd slot directly
+    m._slot_of_thread[-1] = 1
+    m._nslots = 2
+    m.worker_start(1, "b.bin", 200)
+    m.worker_add(1, 50)
+    assert m._committed == 110          # aggregate = sum of worker_add
+    lines = m._format_worker_lines()
+    assert any("a.bin" in ln and "w0" in ln for ln in lines)
+    assert any("b.bin" in ln and "w1" in ln for ln in lines)
+    m.worker_done(w0)                    # streamed: no committed_size
+    m.worker_done(1, committed_size=0)
+    with m:
+        pass
+    out = v._stream.getvalue()
+    assert "[src] hash done: 2 files" in out
+
+
+def test_worker_done_failure_counts():
+    v = _v()
+    m = progress.ProgressMeter(v, "[src] hash", total_files=1)
+    w = m.worker_slot()
+    m.worker_start(w, "x", 10)
+    m.worker_done(w, ok=False)
+    with m:
+        pass
+    assert "1 failed" in v._err.getvalue()
+
+
+def test_idle_slots_render_placeholder():
+    v = _v()
+    m = progress.ProgressMeter(v, "[s] hash")
+    m.worker_slot()
+    m._nslots = 3                        # 3 slots, only w0 active
+    m.worker_start(0, "live.bin", 50)
+    m.worker_add(0, 25)
+    lines = m._format_worker_lines()
+    assert len(lines) == 3
+    assert "live.bin" in lines[0]
+    assert "idle" in lines[1] and "idle" in lines[2]
+
+
+def test_inflight_advances_processed_but_not_speed():
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=2, total_bytes=1000,
+                               cumulative=True)
+    m._start_t = time.time() - 2.0
+    m.file_done(committed_size=300)        # one file done → committed 300
+    m.set_inflight(150)                    # 150 B into the next file
+    assert m._processed() == 450           # bytes/% include inflight
+    m._refresh_speed()
+    # cumulative speed uses committed only (300/2s≈150), NOT 450 — inflight
+    # must never inflate speed/ETA.
+    assert 100 <= m._speed <= 200
+    line = m._format_line()
+    assert "450 B/1000 B" in line or "0.44 KiB/0.98 KiB" in line
+    m.file_done(committed_size=300)        # next file done → inflight cleared
+    assert m._inflight == 0
+    assert m._processed() == 600
+
+
+def test_inflight_zero_degrades_to_wallclock():
+    """No .partial watcher ⇒ inflight stays 0 ⇒ identical to pre-Stage-C."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=1, total_bytes=100,
+                               cumulative=True)
+    assert m._inflight == 0
+    m.file_done(committed_size=100)
+    with m:
+        pass
+    assert "[copy] done: 1 files, 100 B" in v._stream.getvalue()
+
+
+def test_pct_has_two_decimals():
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=15,
+                               total_bytes=226 * 1024**3)
+    m.add_processed(471 * 1024**2)        # 471 MiB of 226 GiB ≈ 0.20%
+    line = m._format_line()
+    assert "(0.20%)" in line              # not "(0%)"
+    assert "(0%)" not in line
+
+
+def test_windowed_copy_speed_from_inflight():
+    """Stage H: a non-cumulative meter fed continuous inflight (the
+    .partial watcher) yields a real speed + ETA mid-file, not '--'."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=2,
+                               total_bytes=1000)  # default = windowed
+    m._last_sample_t = time.time() - 1.0
+    m.set_inflight(200)                   # 200 B into the first file
+    m._refresh_speed()
+    assert m._speed > 0                   # inflight drives speed (windowed)
+    line = m._format_line()
+    assert "--" not in line.split("cur:")[0]   # a real rate is shown
+    assert "ETA" in line
 
 
 def test_quiet_level_is_silent():

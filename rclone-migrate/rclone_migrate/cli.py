@@ -17,6 +17,7 @@ from . import audit as audit_mod
 from . import config as config_mod
 from . import ops
 from . import profiles as profiles_mod
+from . import manifest as manifest_mod
 from . import query as query_mod
 from . import state as state_mod
 from . import verbose as verbose_mod
@@ -200,12 +201,17 @@ def cmd_copy(argv: Optional[List[str]] = None) -> int:
                    help="Force full re-hash before copying")
     p.add_argument("--dry-run", action="store_true",
                    help="Print what would be copied; do nothing")
+    p.add_argument("--no-clean-partial", action="store_true",
+                   help="Don't remove .partial temp files orphaned by a "
+                        "prior interrupted run (default: remove them — "
+                        "they cannot resume and would wedge this run)")
     args = p.parse_args(argv)
     cfg, job = _load(args)
     v = _make_verbose(args)
     return ops.do_copy(
         cfg, job, no_refresh=args.no_refresh, full=args.full,
-        dry_run=args.dry_run, progress=not args.quiet, v=v,
+        dry_run=args.dry_run, clean_partial=not args.no_clean_partial,
+        progress=not args.quiet, v=v,
     )
 
 
@@ -934,13 +940,23 @@ def cmd_delete(argv: Optional[List[str]] = None) -> int:
 # expects functions that may return None; sys.exit makes both work).
 
 def _safe_exit(fn) -> int:
-    """Translate LockContention into a clean exit-3 message instead of a
-    traceback. Other exceptions still propagate."""
+    """Translate LockContention into a clean exit-3 message, and Ctrl-C into
+    a clean exit-130, instead of a traceback. Other exceptions propagate."""
     try:
         return fn()
     except audit_mod.LockContention as e:
         print(f"REFUSE: {e}", file=sys.stderr)
         return 3
+    except manifest_mod.UnreachableRootError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 4
+    except KeyboardInterrupt:
+        # rclone children share the tty process group and have already
+        # exited on the same SIGINT, removing their own .partial files.
+        # Completed files are committed/recorded — rerun resumes.
+        print("\nInterrupted — rerun to resume (completed files are kept).",
+              file=sys.stderr)
+        return 130
 
 
 def hash_cmd() -> None:  sys.exit(_safe_exit(cmd_hash))
@@ -967,7 +983,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         )
         sys.exit(0 if argv and argv[0] in ("-h", "--help") else 2)
     sub, rest = argv[0], argv[1:]
-    locked = {"hash", "copy", "check", "delete", "export-mhl"}
     table = {
         "hash": cmd_hash, "copy": cmd_copy, "check": cmd_check,
         "delete": cmd_delete, "list-jobs": cmd_list_jobs,
@@ -979,9 +994,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"unknown subcommand: {sub}", file=sys.stderr)
         sys.exit(2)
     fn = table[sub]
-    if sub in locked:
-        sys.exit(_safe_exit(lambda: fn(rest)))
-    sys.exit(fn(rest))
+    sys.exit(_safe_exit(lambda: fn(rest)))
 
 
 if __name__ == "__main__":
