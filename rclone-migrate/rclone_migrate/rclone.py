@@ -4,7 +4,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import subprocess
+import threading
+import urllib.request
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -261,16 +264,108 @@ def hashsum_file(algo: str, file_path: str, download: bool = False) -> Optional[
     return None
 
 
-def copyto(src: str, dst: str, algo: str, transfers: int = 8, extra: Optional[List[str]] = None) -> None:
-    args = [
-        "copyto",
-        "--checksum",
-        "--transfers", str(transfers),
-        src, dst,
-    ]
+_RC_POLL_INTERVAL = 0.7  # seconds between core/stats polls (≈1.4 Hz)
+
+
+def _free_loopback_port() -> int:
+    """Grab an ephemeral port the OS just told us is free. There is a small
+    race between close() and rclone's bind(); the caller retries once."""
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _copyto_rc(full: List[str], on_stats) -> Tuple[int, str]:
+    """Run an rclone copy/copyto that has --rc enabled, polling its
+    core/stats HTTP endpoint ~1.4Hz and forwarding (bytes, speed) to
+    ``on_stats`` until the process exits. Returns (returncode, stderr)."""
+    # --rc-addr is passed as a single "--rc-addr=host:port" token.
+    addr = next((a.split("=", 1)[1] for a in full if a.startswith("--rc-addr=")), "")
+    url = f"http://{addr}/core/stats"
+    proc = subprocess.Popen(
+        full, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+    )
+    stop = threading.Event()
+
+    def poll() -> None:
+        while not stop.wait(_RC_POLL_INTERVAL):
+            try:
+                req = urllib.request.Request(url, data=b"{}", method="POST")
+                with urllib.request.urlopen(req, timeout=2) as r:
+                    s = json.load(r)
+            except Exception:
+                continue  # server not up yet / transient — keep trying
+            try:
+                tr = s.get("transferring") or []
+                if tr:
+                    cur = tr[0]
+                    spd = cur.get("speedAvg") or s.get("speed") or 0.0
+                    on_stats(int(cur.get("bytes", 0)), float(spd))
+                else:
+                    on_stats(int(s.get("bytes", 0)),
+                             float(s.get("speed") or 0.0))
+            except Exception:
+                pass
+
+    th = threading.Thread(target=poll, name="rmig-rc-poll", daemon=True)
+    th.start()
+    try:
+        _, err = proc.communicate()
+    finally:
+        stop.set()
+        th.join(timeout=2)
+    return proc.returncode, err or ""
+
+
+def copyto(
+    src: str,
+    dst: str,
+    algo: str,
+    transfers: int = 8,
+    extra: Optional[List[str]] = None,
+    on_stats=None,
+) -> None:
+    """Copy a single object with `rclone copyto --checksum`.
+
+    When ``on_stats`` is given it is called ~1.4×/s as
+    ``on_stats(bytes_transferred: int, speed_bps: float)`` with live
+    figures polled from rclone's ``core/stats`` remote-control endpoint
+    (the maintainer-blessed path — ``--use-json-log --stats`` does not emit
+    interim stats for a single-object copyto). The rc server binds an
+    ephemeral 127.0.0.1 port with ``--rc-no-auth``: loopback-only and gone
+    when the copy finishes.
+    """
+    args = ["copyto", "--checksum", "--transfers", str(transfers)]
     if extra:
         args.extend(extra)
-    _run(args, capture=False)
+    if on_stats is None:
+        _run(args + [src, dst], capture=False)
+        return
+
+    last_err = ""
+    for attempt in range(2):  # one retry for the close()/bind() port race
+        port = _free_loopback_port()
+        full = [
+            _bin(), *args,
+            "--rc", f"--rc-addr=127.0.0.1:{port}", "--rc-no-auth",
+            src, dst,
+        ]
+        if _VERBOSE_HOOK is not None and _VERBOSE_HOOK.is_detail():
+            import shlex
+            _VERBOSE_HOOK.detail("    $ " + " ".join(shlex.quote(a) for a in full))
+        rc, err = _copyto_rc(full, on_stats)
+        if rc == 0:
+            if _VERBOSE_HOOK is not None and _VERBOSE_HOOK.is_detail() and err.strip():
+                for line in err.splitlines():
+                    _VERBOSE_HOOK.detail(f"    | {line}")
+            return
+        last_err = err
+        if "address already in use" not in err.lower():
+            break
+    raise RcloneError(f"rclone copyto failed:\n{last_err}")
 
 
 def deletefile(path: str) -> None:

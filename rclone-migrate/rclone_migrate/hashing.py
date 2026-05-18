@@ -90,13 +90,25 @@ def negotiate(
     return sorted(common)[0]
 
 
-def hash_file_local(path: str, algo: str, chunk_size: int = 1 << 20) -> str:
-    """Compute hash of a local file using hashlib if possible, else rclone."""
+def hash_file_local(
+    path: str,
+    algo: str,
+    chunk_size: int = 1 << 20,
+    progress_cb=None,
+) -> str:
+    """Compute hash of a local file using hashlib if possible, else rclone.
+
+    ``progress_cb``, if given, is called with the byte count of each chunk
+    read so callers can drive a live throughput meter even while a single
+    large file is being hashed.
+    """
     if algo in HASHLIB_SUPPORTED:
         h = hashlib.new(algo)
         with open(path, "rb") as f:
             while chunk := f.read(chunk_size):
                 h.update(chunk)
+                if progress_cb is not None:
+                    progress_cb(len(chunk))
         return h.hexdigest()
     # Fallback to rclone for exotic algorithms
     result = rclone.hashsum_file(algo, path)

@@ -11,6 +11,7 @@ Three backend strategies:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import sqlite3
@@ -22,6 +23,7 @@ from threading import Lock
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from . import cache, hashing, rclone, state
+from . import progress as progress_mod
 from . import verbose as verbose_mod
 from .config import Job
 
@@ -240,16 +242,26 @@ def _refresh_local(
     failures: List[Tuple[str, str]] = []
     new_lock = Lock()
 
+    meter = progress_mod.ProgressMeter(
+        v, f"[{side}] hash",
+        total_files=len(to_hash),
+        total_bytes=sum(current[p][0] for p in to_hash if p in current),
+    )
+
     def hash_one(rel: str) -> None:
         full_path = root_path / rel
         t0 = time.time()
         try:
             st = full_path.stat()
-            h = hashing.hash_file_local(str(full_path), algorithm)
+            meter.set_current(rel)
+            h = hashing.hash_file_local(
+                str(full_path), algorithm, progress_cb=meter.add_processed,
+            )
         except (OSError, IOError) as e:
             with new_lock:
                 failures.append((rel, repr(e)))
             v.detail(f"    FAIL {rel}: {e}")
+            meter.file_done(ok=False)
             return
         with new_lock:
             entry = cache.CacheEntry(
@@ -258,25 +270,23 @@ def _refresh_local(
             )
             new_entries.append(entry)
             pending_flush.append(entry)
+        meter.file_done()
         v.detail(f"    {rel}  {h}  ({time.time() - t0:.1f}s, {st.st_size:,}B)")
 
     if to_hash:
         if progress:
             v.info(f"[{side}] hashing {len(to_hash)} files with {transfers} threads...")
-        with ThreadPoolExecutor(max_workers=transfers) as pool:
-            futs = [pool.submit(hash_one, p) for p in to_hash]
-            done = 0
-            for fu in as_completed(futs):
-                fu.result()  # hash_one swallows file errors; this raises only on bugs
-                done += 1
-                # Periodic incremental flush so a later failure doesn't lose work
-                with new_lock:
-                    if len(pending_flush) >= FLUSH_EVERY:
-                        cache.upsert_many(conn, pending_flush, refreshed=time.time())
-                        v.debug(f"    [flush] {len(pending_flush)} rows → {db_path.name}")
-                        pending_flush.clear()
-                if progress and (done % 50 == 0 or done == len(to_hash)):
-                    v.info(f"  [{side}] hashed {done}/{len(to_hash)}")
+        with (meter if progress else contextlib.nullcontext()):
+            with ThreadPoolExecutor(max_workers=transfers) as pool:
+                futs = [pool.submit(hash_one, p) for p in to_hash]
+                for fu in as_completed(futs):
+                    fu.result()  # hash_one swallows file errors; this raises only on bugs
+                    # Periodic incremental flush so a later failure doesn't lose work
+                    with new_lock:
+                        if len(pending_flush) >= FLUSH_EVERY:
+                            cache.upsert_many(conn, pending_flush, refreshed=time.time())
+                            v.debug(f"    [flush] {len(pending_flush)} rows → {db_path.name}")
+                            pending_flush.clear()
 
     now = time.time()
     cache.upsert_many(conn, pending_flush, refreshed=now)
@@ -421,7 +431,14 @@ def _refresh_remote(
             pending: List[state.RemoteCacheEntry] = []
             fails: List[Tuple[str, str]] = []
             rlock = Lock()
-            done_count = [0]
+            meter = progress_mod.ProgressMeter(
+                v, f"[{side}] remote-hash",
+                total_files=len(to_hash),
+                total_bytes=sum(
+                    current[p][0] for p in to_hash if p in current
+                ),
+                cumulative=True,  # bytes land per-file, not streamed
+            )
 
             def hash_one(rel: str) -> None:
                 full_path = (
@@ -429,6 +446,7 @@ def _refresh_remote(
                     else f"{root}/{rel}"
                 )
                 t0 = time.time()
+                meter.set_current(rel)
                 v.detail(f"    rclone hashsum {algorithm} {full_path}"
                          f"{' --download' if download else ''}")
                 try:
@@ -438,11 +456,13 @@ def _refresh_remote(
                     with rlock:
                         fails.append((rel, repr(e)))
                     v.detail(f"    FAIL {rel}: {e}")
+                    meter.file_done(ok=False)
                     return
                 if h is None:
                     with rlock:
                         fails.append((rel, "hashsum returned None"))
                     v.detail(f"    FAIL {rel}: hashsum returned None")
+                    meter.file_done(ok=False)
                     return
                 size, mtime = current[rel]
                 entry = state.RemoteCacheEntry(
@@ -452,23 +472,16 @@ def _refresh_remote(
                 with rlock:
                     pending.append(entry)
                     fresh.append(entry)
-                    done_count[0] += 1
                     if len(pending) >= FLUSH_EVERY:
                         _flush(pending)
-                    if progress and (
-                        done_count[0] % 10 == 0
-                        or done_count[0] == len(to_hash)
-                    ):
-                        v.info(
-                            f"  [{side}] remote-hashed "
-                            f"{done_count[0]}/{len(to_hash)}"
-                        )
+                meter.file_done(committed_size=size)
                 v.detail(f"    {rel}  {h}  ({time.time() - t0:.1f}s)")
 
-            with ThreadPoolExecutor(max_workers=transfers) as pool:
-                futs = [pool.submit(hash_one, p) for p in to_hash]
-                for fu in as_completed(futs):
-                    fu.result()
+            with (meter if progress else contextlib.nullcontext()):
+                with ThreadPoolExecutor(max_workers=transfers) as pool:
+                    futs = [pool.submit(hash_one, p) for p in to_hash]
+                    for fu in as_completed(futs):
+                        fu.result()
             with rlock:
                 _flush(pending)
 
@@ -496,32 +509,41 @@ def _refresh_remote(
                 f"{' --download' if download else ''}  (streaming)"
             )
             pending: List[state.RemoteCacheEntry] = []
-            done = 0
-            stale_or_new = set(to_hash)
-            try:
-                for h, p in rclone.hashsum_streaming(
-                    algorithm, root, download=download,
-                ):
-                    if p not in current:
-                        # File listed by hashsum but not by our prior lsf
-                        # (race window) — store with what we have
-                        size, mtime = -1, None
-                    else:
-                        size, mtime = current[p]
-                    entry = state.RemoteCacheEntry(
-                        side=side, path=p, algorithm=algorithm,
-                        hash=h, size=size, modtime=mtime,
-                    )
-                    pending.append(entry)
-                    fresh.append(entry)
-                    v.detail(f"    {p}  {h}")
-                    done += 1
-                    if len(pending) >= FLUSH_EVERY:
-                        _flush(pending)
-                    if progress and done % 100 == 0:
-                        v.info(f"  [{side}] streamed {done} hashes")
-            finally:
-                _flush(pending)
+            meter = progress_mod.ProgressMeter(
+                v, f"[{side}] remote-hash (stream)",
+                total_files=len(current) or None,
+                total_bytes=sum(
+                    s for s, _ in current.values() if s and s > 0
+                ),
+                cumulative=True,
+            )
+            ctx = meter if progress else contextlib.nullcontext()
+            with ctx:
+                try:
+                    for h, p in rclone.hashsum_streaming(
+                        algorithm, root, download=download,
+                    ):
+                        if p not in current:
+                            # File listed by hashsum but not by our prior lsf
+                            # (race window) — store with what we have
+                            size, mtime = -1, None
+                        else:
+                            size, mtime = current[p]
+                        entry = state.RemoteCacheEntry(
+                            side=side, path=p, algorithm=algorithm,
+                            hash=h, size=size, modtime=mtime,
+                        )
+                        pending.append(entry)
+                        fresh.append(entry)
+                        meter.set_current(p)
+                        meter.file_done(
+                            committed_size=size if size >= 0 else None
+                        )
+                        v.detail(f"    {p}  {h}")
+                        if len(pending) >= FLUSH_EVERY:
+                            _flush(pending)
+                finally:
+                    _flush(pending)
 
     state.rhc_delete(state_conn, side, removed, algorithm)
 

@@ -5,6 +5,7 @@ state.db meta bookkeeping that gates delete on a successful prior check.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from . import audit, hashing, manifest, mhl, rclone, state
+from . import progress as progress_mod
 from . import verbose as verbose_mod
 from .config import Config, Job
 
@@ -234,7 +236,18 @@ def do_copy(
         if job.resolved_download(cfg.defaults):
             extra.append("--download")
 
-        with v.phase(f"copy {len(plan.to_copy)} files"):
+        meter = progress_mod.ProgressMeter(
+            v, "[copy]",
+            total_files=len(plan.to_copy),
+            total_bytes=sum(max(e.size, 0) for e in plan.to_copy),
+            periodic=False,  # per-file v.info lines below already log progress
+            # speed/ETA come live from rclone's rc core/stats (see
+            # rclone.copyto on_stats); no wall-clock fallback needed.
+        )
+        live_copy = progress and not dry_run
+        with v.phase(f"copy {len(plan.to_copy)} files"), (
+            meter if live_copy else contextlib.nullcontext()
+        ):
             for i, ent in enumerate(plan.to_copy, 1):
                 src_full = _join(job.src, ent.path)
                 dst_full = _join(job.dst, ent.path)
@@ -243,13 +256,20 @@ def do_copy(
                     continue
                 if progress:
                     v.info(f"  [{i}/{len(plan.to_copy)}] {ent.path}")
+                    meter.set_current(ent.path)
                 v.detail(f"    rclone copyto {src_full} {dst_full}")
                 try:
-                    rclone.copyto(src_full, dst_full, algo, transfers=transfers, extra=extra)
+                    rclone.copyto(
+                        src_full, dst_full, algo, transfers=transfers,
+                        extra=extra,
+                        on_stats=(meter.set_inflight if live_copy else None),
+                    )
                     copied_dst_paths.append(ent.path)
+                    meter.file_done(committed_size=max(ent.size, 0))
                     ev.record_file("dst", ent.path, outcome="copied", hash=ent.hash)
                 except rclone.RcloneError as e:
                     failures += 1
+                    meter.file_done(ok=False)
                     v.error(f"    FAIL: {e}")
                     ev.record_file("dst", ent.path, outcome="failed",
                                    hash=ent.hash, detail=str(e))
