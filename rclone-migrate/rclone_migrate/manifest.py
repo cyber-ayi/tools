@@ -14,12 +14,13 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import os
+import shlex
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from . import cache, hashing, rclone, state
@@ -81,6 +82,52 @@ class Manifest:
             h.update(hh.encode("ascii"))
             h.update(b"\n")
         return h.hexdigest()
+
+
+class UnreachableRootError(RuntimeError):
+    """A src/dst local root did not respond to a stat within the probe
+    timeout — almost always a stale/dead network mount. Raised *instead of*
+    blocking forever in an uninterruptible smbfs/nfs syscall (which even
+    Ctrl-C can't break until the kernel mount times out)."""
+
+
+# Stage D: a dead SMB/NFS mount makes Path.exists()/os.walk() block in an
+# uninterruptible kernel syscall on the main thread. Probe reachability
+# from a daemon thread first and fail fast with a clear message.
+ROOT_PROBE_TIMEOUT = 10.0  # seconds; override via $RMIG_ROOT_PROBE_TIMEOUT
+
+
+def _probe_reachable(root_path: Path, side: str,
+                     v: "verbose_mod.Verbose") -> None:
+    try:
+        timeout = float(os.environ.get("RMIG_ROOT_PROBE_TIMEOUT",
+                                       ROOT_PROBE_TIMEOUT))
+    except (TypeError, ValueError):
+        timeout = ROOT_PROBE_TIMEOUT
+    if timeout <= 0:
+        return  # explicitly disabled
+    done = Event()
+
+    def _probe() -> None:
+        try:
+            os.stat(root_path)   # ENOENT/EACCES return fast → normal flow
+        except OSError:
+            pass
+        finally:
+            done.set()
+
+    # daemon: if it wedges in D-state on a dead mount we still return and
+    # raise; the leaked thread can't be joined but the process can exit.
+    Thread(target=_probe, name="rmig-root-probe", daemon=True).start()
+    if not done.wait(timeout):
+        raise UnreachableRootError(
+            f"{side} root did not respond within {timeout:.0f}s: "
+            f"{root_path}\n"
+            f"  Likely a stale/dead network mount. Verify it is alive:\n"
+            f"    time ls {shlex.quote(str(root_path))}\n"
+            f"  then remount it (or fix the job's {side} path) and retry."
+        )
+    v.detail(f"  [{side}] root reachable: {root_path}")
 
 
 # ----------------- Refresh strategies -----------------
@@ -160,6 +207,7 @@ def _refresh_local(
     if v is None:
         v = verbose_mod.default()
     root_path = Path(os.path.expanduser(root))
+    _probe_reachable(root_path, side, v)  # fail fast on dead mounts
     if not root_path.exists():
         raise FileNotFoundError(f"local root does not exist: {root_path}")
 
@@ -178,6 +226,8 @@ def _refresh_local(
     # Walk directory. Skip our own sidecar dirs (.rmig-cache.db family +
     # ascmhl/ when MHL emit is on) so they don't pollute the manifest or
     # become candidates for hashing.
+    if progress:
+        v.info(f"[{side}] scanning {root} …")  # walk can be slow over SMB
     current: Dict[str, Tuple[int, float]] = {}
     for dirpath, dirnames, filenames in os.walk(root_path):
         # Prune ascmhl/ at any depth (matches MHL spec's default ignore).

@@ -17,6 +17,7 @@ from . import audit as audit_mod
 from . import config as config_mod
 from . import ops
 from . import profiles as profiles_mod
+from . import manifest as manifest_mod
 from . import query as query_mod
 from . import state as state_mod
 from . import verbose as verbose_mod
@@ -941,6 +942,9 @@ def _safe_exit(fn) -> int:
     except audit_mod.LockContention as e:
         print(f"REFUSE: {e}", file=sys.stderr)
         return 3
+    except manifest_mod.UnreachableRootError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 4
     except KeyboardInterrupt:
         # rclone children share the tty process group and have already
         # exited on the same SIGINT, removing their own .partial files.
