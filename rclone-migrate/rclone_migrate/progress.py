@@ -93,6 +93,10 @@ class ProgressMeter:
 
         self._lock = threading.Lock()
         self._committed = 0
+        self._inflight = 0    # current in-flight file bytes (copy .partial
+                              # watch); display-only — speed stays committed-
+                              # based so it can't be inflated. 0 ⇒ no watch
+                              # (graceful degrade to wall-clock behaviour).
         self._files_done = 0
         self._current = ""
         self._active = 0      # files between set_current() and file_done()
@@ -171,6 +175,15 @@ class ProgressMeter:
         with self._lock:
             self._committed += nbytes
 
+    def set_inflight(self, nbytes: int) -> None:
+        """Absolute byte size of the current in-flight file, sampled from
+        rclone's on-disk ``.partial`` (copy). Display-only: makes the bar
+        advance within a large file without touching the committed-based
+        speed. If the watcher finds nothing this stays 0 and the meter
+        behaves exactly like the wall-clock model."""
+        with self._lock:
+            self._inflight = max(0, nbytes)
+
     def file_done(self, committed_size: Optional[int] = None,
                    ok: bool = True) -> None:
         """Mark one file finished.
@@ -185,6 +198,7 @@ class ProgressMeter:
                 self._failures += 1
             if committed_size is not None and committed_size >= 0:
                 self._committed += committed_size
+            self._inflight = 0
         if not self.live:
             self._maybe_periodic()
 
@@ -233,7 +247,7 @@ class ProgressMeter:
     # --- rendering ---------------------------------------------------------
 
     def _processed(self) -> int:
-        return self._committed
+        return self._committed + self._inflight
 
     def _refresh_speed(self) -> None:
         if self._cumulative:

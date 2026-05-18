@@ -198,6 +198,37 @@ def test_idle_slots_render_placeholder():
     assert "idle" in lines[1] and "idle" in lines[2]
 
 
+def test_inflight_advances_processed_but_not_speed():
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=2, total_bytes=1000,
+                               cumulative=True)
+    m._start_t = time.time() - 2.0
+    m.file_done(committed_size=300)        # one file done → committed 300
+    m.set_inflight(150)                    # 150 B into the next file
+    assert m._processed() == 450           # bytes/% include inflight
+    m._refresh_speed()
+    # cumulative speed uses committed only (300/2s≈150), NOT 450 — inflight
+    # must never inflate speed/ETA.
+    assert 100 <= m._speed <= 200
+    line = m._format_line()
+    assert "450 B/1000 B" in line or "0.44 KiB/0.98 KiB" in line
+    m.file_done(committed_size=300)        # next file done → inflight cleared
+    assert m._inflight == 0
+    assert m._processed() == 600
+
+
+def test_inflight_zero_degrades_to_wallclock():
+    """No .partial watcher ⇒ inflight stays 0 ⇒ identical to pre-Stage-C."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=1, total_bytes=100,
+                               cumulative=True)
+    assert m._inflight == 0
+    m.file_done(committed_size=100)
+    with m:
+        pass
+    assert "[copy] done: 1 files, 100 B" in v._stream.getvalue()
+
+
 def test_quiet_level_is_silent():
     v = _v(level=verbose.QUIET)
     m = progress.ProgressMeter(v, "[q]", total_files=1)

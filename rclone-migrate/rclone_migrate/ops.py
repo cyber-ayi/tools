@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,66 @@ from . import audit, hashing, manifest, mhl, rclone, state
 from . import progress as progress_mod
 from . import verbose as verbose_mod
 from .config import Config, Job
+
+
+# --- copy intra-file progress (Stage C) ------------------------------------
+
+class _PartialWatch:
+    """Stage C: while a single `rclone copyto` runs, poll its on-disk
+    partial file so the copy meter advances *within* a large file.
+
+    rclone's local backend streams to `<dst>.<hex>.partial` (size grows
+    incrementally — verified) then renames. We sample the largest matching
+    `<basename>*.partial` (or the final file) in the dst dir ~2.5×/s and
+    feed it to `meter.set_inflight`. Watcher is deliberately best-effort:
+    if nothing matches (rclone --inplace, an SMB mount that hides the
+    growing size, a missing dir) inflight stays 0 and the meter silently
+    behaves exactly like the wall-clock model — no warning, no special
+    casing of mount type.
+    """
+
+    def __init__(self, dst_full: str, meter, interval: float = 0.4):
+        self._dir = os.path.dirname(dst_full) or "."
+        self._base = os.path.basename(dst_full)
+        self._meter = meter
+        self._interval = interval
+        self._stop = threading.Event()
+        self._t: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "_PartialWatch":
+        self._t = threading.Thread(
+            target=self._run, name="rmig-partial-watch", daemon=True
+        )
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._stop.set()
+        if self._t is not None:
+            self._t.join(timeout=1.5)
+        return False
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            best = 0
+            try:
+                with os.scandir(self._dir) as it:
+                    for e in it:
+                        n = e.name
+                        if n == self._base or (
+                            n.startswith(self._base) and n.endswith(".partial")
+                        ):
+                            try:
+                                best = max(
+                                    best,
+                                    e.stat(follow_symlinks=False).st_size,
+                                )
+                            except OSError:
+                                pass
+            except OSError:
+                continue  # dir not created yet / transient
+            if best:
+                self._meter.set_inflight(best)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -260,10 +321,12 @@ def do_copy(
                     meter.set_current(ent.path)
                 v.detail(f"    rclone copyto {src_full} {dst_full}")
                 try:
-                    rclone.copyto(
-                        src_full, dst_full, algo, transfers=transfers,
-                        extra=extra,
-                    )
+                    with (_PartialWatch(dst_full, meter)
+                          if live_copy else contextlib.nullcontext()):
+                        rclone.copyto(
+                            src_full, dst_full, algo, transfers=transfers,
+                            extra=extra,
+                        )
                     copied_dst_paths.append(ent.path)
                     meter.file_done(committed_size=max(ent.size, 0))
                     ev.record_file("dst", ent.path, outcome="copied", hash=ent.hash)
