@@ -112,6 +112,42 @@ def test_marker_excluded_from_manifest(tmp_path):
     assert ".rmig-dataset" not in paths          # …but NOT in the manifest
 
 
+def test_readonly_resolve_no_marker_does_not_create(tmp_path):
+    """create=False (file-status): must NOT write the marker or migrate."""
+    root = tmp_path / "d"; root.mkdir()
+    fb = tmp_path / "fb"
+    db, dsid = cache.resolve_fallback_db(root, fb, create=False)
+    assert dsid is None
+    assert db == cache._legacy_fallback_db(root, fb)
+    assert not (root / ".rmig-dataset").exists()      # not created
+
+
+def test_readonly_resolve_marker_present_points_at_data(tmp_path):
+    """Marker exists, id-db not yet materialised, legacy holds the data:
+    read-only resolve must point at legacy (no copy) — same data the
+    mutating path would read."""
+    root = tmp_path / "d"; root.mkdir()
+    fb = tmp_path / "fb"; fb.mkdir()
+    (root / ".rmig-dataset").write_text("feedfacecafebeef\n")
+    legacy = cache._legacy_fallback_db(root, fb)
+    cache.open_db(legacy).close()                      # legacy exists
+    db, dsid = cache.resolve_fallback_db(root, fb, create=False)
+    assert dsid == "feedfacecafebeef"
+    assert db == legacy                                # not the id-db copy
+    assert not (fb / f"cache-{dsid}.db").exists()      # no migration done
+
+
+def test_readonly_resolve_matches_mutating_after_migration(tmp_path):
+    """Once the mutating path has migrated, read-only resolves to the
+    same id-db (file-status now sees current hashes)."""
+    root = tmp_path / "d"; root.mkdir()
+    fb = tmp_path / "fb"; fb.mkdir()
+    cache.open_db(cache._legacy_fallback_db(root, fb)).close()
+    rw_db, dsid = cache.resolve_fallback_db(root, fb, _v())   # create=True → migrates
+    ro_db, ro_id = cache.resolve_fallback_db(root, fb, create=False)
+    assert ro_db == rw_db and ro_id == dsid
+
+
 def test_meta_dataset_id_roundtrip(tmp_path):
     db = tmp_path / "x.db"
     c = cache.open_db(db)

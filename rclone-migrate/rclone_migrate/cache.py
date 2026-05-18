@@ -129,10 +129,14 @@ def _legacy_fallback_db(root_path: Path, fallback_dir: Path) -> Path:
     return fallback_dir / f"cache-{digest}.db"
 
 
-def _dataset_id(root_path: Path, v=None) -> Optional[str]:
+def _dataset_id(root_path: Path, v=None, *, create: bool = True) -> Optional[str]:
     """Read (or create) <root>/.rmig-dataset. Returns the id, or None if
     the marker can't be read/written (e.g. read-only root) — caller then
-    falls back to the legacy path-keyed db (no regression)."""
+    falls back to the legacy path-keyed db (no regression).
+
+    ``create=False`` is read-only: an existing marker is honoured, but a
+    missing one is NOT created (used by query/file-status, which must not
+    mutate the data root)."""
     marker = root_path / MARKER_FILENAME
     try:
         if marker.is_file():
@@ -143,6 +147,8 @@ def _dataset_id(root_path: Path, v=None) -> Optional[str]:
             if tok:
                 return tok
     except OSError:
+        return None
+    if not create:
         return None
     dsid = uuid.uuid4().hex
     try:
@@ -165,23 +171,32 @@ def _dataset_id(root_path: Path, v=None) -> Optional[str]:
 
 
 def resolve_fallback_db(
-    root_path: Path, fallback_dir: Path, v=None
+    root_path: Path, fallback_dir: Path, v=None, *, create: bool = True
 ) -> Tuple[Path, Optional[str]]:
     """Return (db_path, dataset_id). db is keyed by the stable dataset id
     (mount-path independent); dataset_id is None when the marker was
     unavailable (read-only root) and we fell back to the legacy path-keyed
     db — unchanged v0.3.0 behaviour, no regression.
 
-    Auto-migrates a pre-existing legacy path-keyed db by *copying* it
-    (legacy kept as a rollback backup) so prior hashing work survives a
-    path/share change."""
+    ``create=True`` (mutating callers: refresh/copy/delete) writes the
+    marker if absent and auto-migrates a pre-existing legacy path-keyed db
+    by *copying* it (legacy kept as a rollback backup).
+
+    ``create=False`` (read-only callers: query/file-status) never writes
+    the marker or migrates. It still resolves to the SAME db the mutating
+    path would read: id-db if the marker exists, else legacy; and if the
+    marker exists but the id-db hasn't been materialised yet, it points at
+    the legacy db (that's where the hashes still are) instead of copying."""
     fallback_dir.mkdir(parents=True, exist_ok=True)
     legacy = _legacy_fallback_db(root_path, fallback_dir)
-    dsid = _dataset_id(root_path, v)
+    dsid = _dataset_id(root_path, v, create=create)
     if dsid is None:
         return legacy, None
     db = fallback_dir / f"cache-{dsid}.db"
     if not db.exists() and legacy.exists():
+        if not create:
+            # read-only: data still lives in the legacy db
+            return legacy, dsid
         try:
             shutil.copy2(legacy, db)
             if v is not None:
