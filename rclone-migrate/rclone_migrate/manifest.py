@@ -242,12 +242,13 @@ def _refresh_local(
     failures: List[Tuple[str, str]] = []
     new_lock = Lock()
 
-    # Only hashlib algos stream bytes through hash_file_local's progress_cb;
-    # exotic algos (xxh3, crc32, ...) fall back to a per-file `rclone
-    # hashsum` subprocess with no chunk callback. For those, drive the meter
-    # at file granularity with a wall-clock average instead of a windowed
-    # EMA that would otherwise sit at 0 B / -- the whole run.
-    streamed = algorithm in hashing.HASHLIB_SUPPORTED
+    # hashlib + xxhash-family algos stream bytes through
+    # hash_file_local's progress_cb (windowed EMA). Algos with no local
+    # streaming impl (crc32, blake3, ... without a lib) fall back to a
+    # per-file `rclone hashsum` subprocess with no chunk callback — meter
+    # those at file granularity with a wall-clock average instead of a
+    # windowed EMA that would otherwise sit at 0 B / -- the whole run.
+    streamed = hashing.can_stream_local(algorithm)
     meter = progress_mod.ProgressMeter(
         v, f"[{side}] hash",
         total_files=len(to_hash),
