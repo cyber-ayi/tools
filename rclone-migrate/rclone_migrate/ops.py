@@ -241,8 +241,9 @@ def do_copy(
             total_files=len(plan.to_copy),
             total_bytes=sum(max(e.size, 0) for e in plan.to_copy),
             periodic=False,  # per-file v.info lines below already log progress
-            # speed/ETA come live from rclone's rc core/stats (see
-            # rclone.copyto on_stats); no wall-clock fallback needed.
+            cumulative=True,  # wall-clock: rclone exposes no reliable interim
+                              # copy stats (fast local copies bypass its
+                              # accounting). Credit file size on completion.
         )
         live_copy = progress and not dry_run
         with v.phase(f"copy {len(plan.to_copy)} files"), (
@@ -262,7 +263,6 @@ def do_copy(
                     rclone.copyto(
                         src_full, dst_full, algo, transfers=transfers,
                         extra=extra,
-                        on_stats=(meter.set_inflight if live_copy else None),
                     )
                     copied_dst_paths.append(ent.path)
                     meter.file_done(committed_size=max(ent.size, 0))
