@@ -16,6 +16,28 @@ def test_is_sidecar():
     assert cache.is_sidecar(".rmig-cache.db")
     assert cache.is_sidecar(".rmig-cache.db-wal")
     assert not cache.is_sidecar("VID_0001.insv")
+    # macOS AppleDouble companions of our dotfiles (exFAT/SMB SD cards)
+    assert cache.is_sidecar("._.rmig-dataset")
+    assert cache.is_sidecar("._.rmig-cache.db")
+    assert cache.is_sidecar("._.rmig-cache.db-wal")
+    # but NOT AppleDouble of real media — that's user-data territory
+    assert not cache.is_sidecar("._VID_0001.insv")
+
+
+def test_appledouble_marker_excluded_from_manifest(tmp_path):
+    root = tmp_path / "src"; root.mkdir()
+    (root / "real.bin").write_bytes(b"x" * 16)
+    (root / ".rmig-dataset").write_text("deadbeefcafebabe\n")
+    (root / "._.rmig-dataset").write_bytes(b"\x00\x05\x16\x07")  # AppleDouble
+    m = manifest._refresh_local(
+        "src", str(root), "sha256",
+        transfers=1, full=False, local_cache_in_root=False,
+        fallback_dir=tmp_path / "fb", progress=False, v=_v(),
+    )
+    paths = {e.path for e in m.entries}
+    assert "real.bin" in paths
+    assert ".rmig-dataset" not in paths
+    assert "._.rmig-dataset" not in paths       # the reported bug
 
 
 def test_marker_created_and_db_keyed_by_id(tmp_path):

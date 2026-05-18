@@ -34,8 +34,14 @@ def is_sidecar(name: str) -> bool:
     """True for rmig's own root sidecar files, which must be excluded from
     the manifest/MHL walk. The dataset marker in particular differs
     between src and dst (distinct ids) — including it would make the two
-    manifests never match."""
-    return name.startswith(CACHE_FILENAME) or name == MARKER_FILENAME
+    manifests never match.
+
+    Also matches the macOS AppleDouble companion (``._<name>``) that the
+    OS auto-creates for our dotfiles on exFAT/SMB volumes (e.g. an SD
+    card): ``._.rmig-dataset`` would otherwise be hashed, land in the
+    manifest, and get copied as bogus data."""
+    base = name[2:] if name.startswith("._") else name
+    return base.startswith(CACHE_FILENAME) or base == MARKER_FILENAME
 
 
 @dataclass
