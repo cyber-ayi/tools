@@ -147,6 +147,57 @@ def test_interrupted_summary_says_interrupted(tmp_path):
     assert "done:" not in v._stream.getvalue()
 
 
+def test_worker_api_aggregates_and_multiline_mode():
+    v = _v()
+    m = progress.ProgressMeter(v, "[src] hash", total_files=3,
+                               total_bytes=300)
+    assert m._multiline is False
+    w0 = m.worker_slot()
+    assert m._multiline is True
+    m.worker_start(w0, "a.bin", 100)
+    m.worker_add(w0, 60)
+    # second "thread": monkey a distinct ident by calling from this thread
+    # again returns same slot (thread-stable); simulate a 2nd slot directly
+    m._slot_of_thread[-1] = 1
+    m._nslots = 2
+    m.worker_start(1, "b.bin", 200)
+    m.worker_add(1, 50)
+    assert m._committed == 110          # aggregate = sum of worker_add
+    lines = m._format_worker_lines()
+    assert any("a.bin" in ln and "w0" in ln for ln in lines)
+    assert any("b.bin" in ln and "w1" in ln for ln in lines)
+    m.worker_done(w0)                    # streamed: no committed_size
+    m.worker_done(1, committed_size=0)
+    with m:
+        pass
+    out = v._stream.getvalue()
+    assert "[src] hash done: 2 files" in out
+
+
+def test_worker_done_failure_counts():
+    v = _v()
+    m = progress.ProgressMeter(v, "[src] hash", total_files=1)
+    w = m.worker_slot()
+    m.worker_start(w, "x", 10)
+    m.worker_done(w, ok=False)
+    with m:
+        pass
+    assert "1 failed" in v._err.getvalue()
+
+
+def test_idle_slots_render_placeholder():
+    v = _v()
+    m = progress.ProgressMeter(v, "[s] hash")
+    m.worker_slot()
+    m._nslots = 3                        # 3 slots, only w0 active
+    m.worker_start(0, "live.bin", 50)
+    m.worker_add(0, 25)
+    lines = m._format_worker_lines()
+    assert len(lines) == 3
+    assert "live.bin" in lines[0]
+    assert "idle" in lines[1] and "idle" in lines[2]
+
+
 def test_quiet_level_is_silent():
     v = _v(level=verbose.QUIET)
     m = progress.ProgressMeter(v, "[q]", total_files=1)

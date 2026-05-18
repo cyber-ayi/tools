@@ -98,6 +98,17 @@ class ProgressMeter:
         self._active = 0      # files between set_current() and file_done()
         self._failures = 0
 
+        # Multi-worker mode (parallel hashing): one render line per worker
+        # slot + the aggregate line. Activated lazily the first time
+        # worker_slot() is called; single-stream callers (copy, remote
+        # streaming) never touch it and keep the classic one-line render.
+        self._multiline = False
+        self._slots: dict = {}            # wid -> {path,size,bytes}
+        self._slot_of_thread: dict = {}   # thread ident -> wid
+        self._nslots = 0                  # max distinct wids seen
+        self._max_worker_lines = 12
+        self._block_h = 0                 # lines currently drawn in the block
+
         self._start_t = time.time()
         self._last_sample_t = self._start_t
         self._last_sample_bytes = 0
@@ -143,7 +154,10 @@ class ProgressMeter:
             self._thread.join(timeout=2.0)
             self._thread = None
         if self.live:
-            self._erase_line()
+            if self._multiline:
+                self._erase_block()
+            else:
+                self._erase_line()
         self._emit_summary(interrupted=interrupted)
 
     # --- producer-side updates --------------------------------------------
@@ -171,6 +185,48 @@ class ProgressMeter:
                 self._failures += 1
             if committed_size is not None and committed_size >= 0:
                 self._committed += committed_size
+        if not self.live:
+            self._maybe_periodic()
+
+    # --- per-worker (parallel hash) ---------------------------------------
+
+    def worker_slot(self) -> int:
+        """Stable small slot id for the calling thread (ThreadPoolExecutor
+        reuses threads, so a thread keeps its slot for the whole phase).
+        First call switches the meter into multi-line mode."""
+        tid = threading.get_ident()
+        with self._lock:
+            wid = self._slot_of_thread.get(tid)
+            if wid is None:
+                wid = len(self._slot_of_thread)
+                self._slot_of_thread[tid] = wid
+                self._nslots = max(self._nslots, wid + 1)
+            self._multiline = True
+            return wid
+
+    def worker_start(self, wid: int, path: str, size: Optional[int] = None) -> None:
+        with self._lock:
+            self._slots[wid] = {"path": path, "size": size or 0, "bytes": 0}
+            self._current = path
+
+    def worker_add(self, wid: int, nbytes: int) -> None:
+        """Per-chunk bytes for a worker's in-flight file (streamed hash).
+        Also feeds the aggregate."""
+        with self._lock:
+            s = self._slots.get(wid)
+            if s is not None:
+                s["bytes"] += nbytes
+            self._committed += nbytes
+
+    def worker_done(self, wid: int, committed_size: Optional[int] = None,
+                    ok: bool = True) -> None:
+        with self._lock:
+            self._files_done += 1
+            if not ok:
+                self._failures += 1
+            if committed_size is not None and committed_size >= 0:
+                self._committed += committed_size
+            self._slots.pop(wid, None)
         if not self.live:
             self._maybe_periodic()
 
@@ -242,6 +298,63 @@ class ProgressMeter:
                 line += f"  cur: {disp}"
         return line
 
+    def _format_worker_lines(self) -> list:
+        with self._lock:
+            nslots = self._nslots
+            slots = {k: dict(v) for k, v in self._slots.items()}
+        out = []
+        shown = min(nslots, self._max_worker_lines)
+        for wid in range(shown):
+            s = slots.get(wid)
+            if s is None:
+                out.append(f"  · w{wid}  idle")
+                continue
+            size = s["size"]
+            b = s["bytes"]
+            pct = f"{100.0*b/size:3.0f}%" if size else "  ? "
+            path = s["path"]
+            stem = f"{_human_bytes(b)}/{_human_bytes(size)}" if size else _human_bytes(b)
+            head = f"  ▸ w{wid}  {pct}  {stem}  "
+            budget = 110 - len(head)
+            disp = path if len(path) <= budget else "…" + path[-(budget - 1):]
+            out.append(head + disp)
+        if nslots > shown:
+            out.append(f"  … +{nslots - shown} more workers")
+        return out
+
+    def _write_block(self) -> None:
+        if self._term is None:
+            return
+        worker_lines = self._format_worker_lines()
+        agg = self._format_line()
+        if self._color:
+            agg = verbose_mod.CYAN + agg + verbose_mod.RESET
+        lines = worker_lines + [agg]
+        h = len(lines)
+        try:
+            if self._block_h == 0:
+                self._term.write("\n".join(lines) + "\n")
+            else:
+                # grew? reserve the extra rows first
+                if h > self._block_h:
+                    self._term.write("\n" * (h - self._block_h))
+                self._term.write(f"\033[{max(h, self._block_h)}F")
+                self._term.write("".join("\033[2K" + ln + "\n" for ln in lines))
+            self._term.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        self._block_h = h
+
+    def _erase_block(self) -> None:
+        if self._term is None or self._block_h == 0:
+            return
+        try:
+            self._term.write(f"\033[{self._block_h}F\033[0J")
+            self._term.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass
+        self._block_h = 0
+
     def _write_live(self, line: str) -> None:
         if self._term is None:
             return
@@ -281,7 +394,10 @@ class ProgressMeter:
     def _run(self) -> None:
         while not self._stop.wait(self._interval):
             self._refresh_speed()
-            self._write_live(self._format_line())
+            if self._multiline:
+                self._write_block()
+            else:
+                self._write_live(self._format_line())
 
     def _emit_summary(self, interrupted: bool = False) -> None:
         elapsed = max(time.time() - self._start_t, 1e-6)

@@ -258,19 +258,22 @@ def _refresh_local(
 
     def hash_one(rel: str) -> None:
         full_path = root_path / rel
+        wid = meter.worker_slot()
         t0 = time.time()
         try:
             st = full_path.stat()
-            meter.set_current(rel)
+            meter.worker_start(wid, rel, st.st_size)
             h = hashing.hash_file_local(
                 str(full_path), algorithm,
-                progress_cb=(meter.add_processed if streamed else None),
+                progress_cb=(
+                    (lambda n: meter.worker_add(wid, n)) if streamed else None
+                ),
             )
         except (OSError, IOError) as e:
             with new_lock:
                 failures.append((rel, repr(e)))
             v.detail(f"    FAIL {rel}: {e}")
-            meter.file_done(ok=False)
+            meter.worker_done(wid, ok=False)
             return
         with new_lock:
             entry = cache.CacheEntry(
@@ -279,14 +282,15 @@ def _refresh_local(
             )
             new_entries.append(entry)
             pending_flush.append(entry)
-        meter.file_done(committed_size=None if streamed else st.st_size)
+        meter.worker_done(wid, committed_size=None if streamed else st.st_size)
         v.detail(f"    {rel}  {h}  ({time.time() - t0:.1f}s, {st.st_size:,}B)")
 
     if to_hash:
         if progress:
             v.info(f"[{side}] hashing {len(to_hash)} files with {transfers} threads...")
         with (meter if progress else contextlib.nullcontext()):
-            with ThreadPoolExecutor(max_workers=transfers) as pool:
+            pool = ThreadPoolExecutor(max_workers=transfers)
+            try:
                 futs = [pool.submit(hash_one, p) for p in to_hash]
                 for fu in as_completed(futs):
                     fu.result()  # hash_one swallows file errors; this raises only on bugs
@@ -296,6 +300,15 @@ def _refresh_local(
                             cache.upsert_many(conn, pending_flush, refreshed=time.time())
                             v.debug(f"    [flush] {len(pending_flush)} rows → {db_path.name}")
                             pending_flush.clear()
+            except KeyboardInterrupt:
+                # Stage B: cancel not-yet-started workers immediately so
+                # Ctrl-C is prompt (in-flight files still finish — a single
+                # C-level hash update can't be preempted). Persist whatever
+                # completed below before re-raising.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            finally:
+                pool.shutdown(wait=True)
 
     now = time.time()
     cache.upsert_many(conn, pending_flush, refreshed=now)
