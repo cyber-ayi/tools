@@ -1,6 +1,6 @@
 [project]
 name = "rclone-migrate"
-version = "0.7.0"
+version = "0.7.1"
 description = "Safe rclone migration with copy → check → delete and persisted checksums"
 requires-python = ">=3.9"
 dependencies = [
@@ -9,14 +9,18 @@ dependencies = [
     # third-party MHL tools — defuse against XML attacks (entity
     # expansion, external entity resolution).
     "defusedxml>=0.7",
+    # CORE, not optional: the default `dit` profile (and the whole
+    # camera-original DIT workflow) negotiates xxh3. Without this package
+    # xxh3/xxh128/xxh64 silently degrade to a per-file `rclone hashsum`
+    # subprocess — far slower and with no intra-file progress. Making it
+    # optional caused exactly that in the field. A small pure-wheel dep.
+    "xxhash>=3.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=5.0"]
-# Required for `dit`, `speed`, and any profile that uses xxh64/xxh3/xxh128
-# as the negotiated algorithm against a backend that doesn't compute it
-# natively (i.e. local-side hashing). rclone speaks xxh3/xxh128 but not
-# xxh64; either way we fall back to this Python implementation.
+# Redundant now that xxhash is a core dependency; kept as a no-op so any
+# existing `rclone-migrate[xxhash]` install spec keeps working.
 xxhash = ["xxhash>=3.0"]
 
 [project.scripts]
