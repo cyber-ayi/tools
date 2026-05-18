@@ -354,9 +354,14 @@ def do_copy(
             total_files=len(plan.to_copy),
             total_bytes=sum(max(e.size, 0) for e in plan.to_copy),
             periodic=False,  # per-file v.info lines below already log progress
-            cumulative=True,  # wall-clock: rclone exposes no reliable interim
-                              # copy stats (fast local copies bypass its
-                              # accounting). Credit file size on completion.
+            # Stage H: windowed EMA (not cumulative). Stage C's .partial
+            # watcher feeds continuous inflight bytes, so processed
+            # (committed+inflight) grows smoothly within a large file →
+            # real instantaneous speed + ETA mid-file instead of "--"
+            # until completion. If the watcher finds nothing (rclone
+            # --inplace / a mount that hides the growing size) processed
+            # only jumps at file_done → windowed degrades to per-file
+            # spikes — acceptable rare fallback, no longer the common path.
         )
         live_copy = progress and not dry_run
         with v.phase(f"copy {len(plan.to_copy)} files"), (

@@ -290,7 +290,8 @@ class ProgressMeter:
             pct = 100.0 * processed / total_bytes
             parts.append(
                 f"{_human_bytes(processed)}/{_human_bytes(total_bytes)} "
-                f"({pct:.0f}%)"
+                f"({pct:.2f}%)"  # 2 decimals: a 226 GiB job spends a long
+                                 # time under 1% — integer % reads "0%"
             )
         elif processed:
             parts.append(_human_bytes(processed))

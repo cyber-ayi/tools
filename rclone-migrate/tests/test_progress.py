@@ -229,6 +229,31 @@ def test_inflight_zero_degrades_to_wallclock():
     assert "[copy] done: 1 files, 100 B" in v._stream.getvalue()
 
 
+def test_pct_has_two_decimals():
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=15,
+                               total_bytes=226 * 1024**3)
+    m.add_processed(471 * 1024**2)        # 471 MiB of 226 GiB ≈ 0.20%
+    line = m._format_line()
+    assert "(0.20%)" in line              # not "(0%)"
+    assert "(0%)" not in line
+
+
+def test_windowed_copy_speed_from_inflight():
+    """Stage H: a non-cumulative meter fed continuous inflight (the
+    .partial watcher) yields a real speed + ETA mid-file, not '--'."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=2,
+                               total_bytes=1000)  # default = windowed
+    m._last_sample_t = time.time() - 1.0
+    m.set_inflight(200)                   # 200 B into the first file
+    m._refresh_speed()
+    assert m._speed > 0                   # inflight drives speed (windowed)
+    line = m._format_line()
+    assert "--" not in line.split("cur:")[0]   # a real rate is shown
+    assert "ETA" in line
+
+
 def test_quiet_level_is_silent():
     v = _v(level=verbose.QUIET)
     m = progress.ProgressMeter(v, "[q]", total_files=1)
