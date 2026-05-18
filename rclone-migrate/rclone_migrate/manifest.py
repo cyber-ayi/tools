@@ -242,10 +242,17 @@ def _refresh_local(
     failures: List[Tuple[str, str]] = []
     new_lock = Lock()
 
+    # Only hashlib algos stream bytes through hash_file_local's progress_cb;
+    # exotic algos (xxh3, crc32, ...) fall back to a per-file `rclone
+    # hashsum` subprocess with no chunk callback. For those, drive the meter
+    # at file granularity with a wall-clock average instead of a windowed
+    # EMA that would otherwise sit at 0 B / -- the whole run.
+    streamed = algorithm in hashing.HASHLIB_SUPPORTED
     meter = progress_mod.ProgressMeter(
         v, f"[{side}] hash",
         total_files=len(to_hash),
         total_bytes=sum(current[p][0] for p in to_hash if p in current),
+        cumulative=not streamed,
     )
 
     def hash_one(rel: str) -> None:
@@ -255,7 +262,8 @@ def _refresh_local(
             st = full_path.stat()
             meter.set_current(rel)
             h = hashing.hash_file_local(
-                str(full_path), algorithm, progress_cb=meter.add_processed,
+                str(full_path), algorithm,
+                progress_cb=(meter.add_processed if streamed else None),
             )
         except (OSError, IOError) as e:
             with new_lock:
@@ -270,7 +278,7 @@ def _refresh_local(
             )
             new_entries.append(entry)
             pending_flush.append(entry)
-        meter.file_done()
+        meter.file_done(committed_size=None if streamed else st.st_size)
         v.detail(f"    {rel}  {h}  ({time.time() - t0:.1f}s, {st.st_size:,}B)")
 
     if to_hash:

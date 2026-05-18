@@ -97,6 +97,37 @@ def test_hash_file_local_progress_cb_sums_to_size(tmp_path):
     assert len(seen) == 4   # 1MiB,1MiB,1MiB,tail
 
 
+def test_non_hashlib_algo_still_reports_bytes(tmp_path, monkeypatch):
+    """Regression: xxh3 (and other rclone-fallback algos) don't stream
+    through progress_cb. The local refresh must still credit file sizes so
+    the meter doesn't sit at '0 B / -- ' the entire run."""
+    from rclone_migrate import hashing, manifest
+
+    root = tmp_path / "src"
+    root.mkdir()
+    for i in range(3):
+        (root / f"f{i}.lrv").write_bytes(b"D" * 4096)
+
+    # Simulate a non-hashlib algo: returns a digest WITHOUT calling
+    # progress_cb (exactly how the rclone-subprocess fallback behaves).
+    def fake_hash(path, algo, chunk_size=1 << 20, progress_cb=None):
+        return "deadbeef"
+
+    monkeypatch.setattr(hashing, "hash_file_local", fake_hash)
+    monkeypatch.setattr(hashing, "HASHLIB_SUPPORTED", {"md5", "sha256"})
+
+    v = _v()
+    manifest._refresh_local(
+        "src", str(root), "xxh3",
+        transfers=2, full=False, local_cache_in_root=False,
+        fallback_dir=tmp_path / "fb", progress=True, v=v,
+    )
+    out = v._stream.getvalue()
+    assert "[src] hash done: 3 files" in out
+    assert "12.00 KiB" in out          # 3×4096 credited, not 0 B
+    assert "0 B in" not in out
+
+
 def test_quiet_level_is_silent():
     v = _v(level=verbose.QUIET)
     m = progress.ProgressMeter(v, "[q]", total_files=1)
