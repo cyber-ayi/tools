@@ -58,15 +58,12 @@ def _human_eta(seconds: float) -> str:
 class ProgressMeter:
     """A thread-safe progress accumulator with an optional 1Hz live line.
 
-    Byte model:
-      * ``committed`` — bytes fully accounted for (finished files, or
-        cumulative chunk progress for local hashing).
-      * ``inflight``  — bytes of the file currently in flight (set absolutely
-        from rclone's JSON stats during copy). Reset on ``file_done``.
-
-    Speed is taken from ``set_inflight``'s ``speed`` argument when provided
-    (rclone reports a real transfer rate); otherwise it is computed from the
-    processed-byte delta between 1s samples with light EMA smoothing.
+    Bytes are accumulated as ``committed`` — either streamed in via
+    ``add_processed`` (local hashlib/xxhash chunk callbacks) or credited
+    per file on ``file_done`` (remote hash, copy). Speed is either a
+    windowed EMA of the processed-byte delta between samples, or, when
+    ``cumulative=True``, simply committed / wall-elapsed (honest for
+    phases whose bytes only land at file-completion granularity).
     """
 
     _SMOOTH = 0.4  # EMA weight for self-computed speed
@@ -96,9 +93,7 @@ class ProgressMeter:
 
         self._lock = threading.Lock()
         self._committed = 0
-        self._inflight = 0
         self._files_done = 0
-        self._ext_speed: Optional[float] = None
         self._current = ""
         self._failures = 0
 
@@ -156,24 +151,17 @@ class ProgressMeter:
             self._current = path
 
     def add_processed(self, nbytes: int) -> None:
-        """Incremental bytes processed (local hash chunks)."""
+        """Incremental bytes processed (local hashlib/xxhash chunks)."""
         with self._lock:
             self._committed += nbytes
-
-    def set_inflight(self, nbytes: int, speed: Optional[float] = None) -> None:
-        """Absolute bytes transferred for the current file (rclone stats)."""
-        with self._lock:
-            self._inflight = nbytes
-            if speed is not None and speed >= 0:
-                self._ext_speed = speed
 
     def file_done(self, committed_size: Optional[int] = None,
                    ok: bool = True) -> None:
         """Mark one file finished.
 
         ``committed_size`` is added to the committed total for byte-unaware
-        callers (remote hash, copy). Local hashing passes ``None`` because the
-        bytes were already streamed in via :meth:`add_processed`.
+        callers (remote hash, copy). Streaming local hashing passes ``None``
+        because the bytes already arrived via :meth:`add_processed`.
         """
         with self._lock:
             self._files_done += 1
@@ -181,15 +169,13 @@ class ProgressMeter:
                 self._failures += 1
             if committed_size is not None and committed_size >= 0:
                 self._committed += committed_size
-            self._inflight = 0
-            self._ext_speed = None
         if not self.live:
             self._maybe_periodic()
 
     # --- rendering ---------------------------------------------------------
 
     def _processed(self) -> int:
-        return self._committed + self._inflight
+        return self._committed
 
     def _refresh_speed(self) -> None:
         if self._cumulative:
@@ -216,12 +202,11 @@ class ProgressMeter:
         with self._lock:
             files_done = self._files_done
             processed = self._processed()
-            ext_speed = self._ext_speed
             current = self._current
             failures = self._failures
             total_files = self._total_files
             total_bytes = self._total_bytes
-        speed = ext_speed if ext_speed is not None else self._speed
+        speed = self._speed
 
         parts = [self._label]
         if total_files:
@@ -300,7 +285,7 @@ class ProgressMeter:
         elapsed = max(time.time() - self._start_t, 1e-6)
         with self._lock:
             files_done = self._files_done
-            processed = self._committed  # inflight is 0 after stop
+            processed = self._committed
             failures = self._failures
         avg = processed / elapsed
         msg = (
