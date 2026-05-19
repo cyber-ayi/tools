@@ -44,8 +44,13 @@ def _human_rate(bps: float) -> str:
     return f"{_human_bytes(bps)}/s"
 
 
+_ETA_MAX = 100 * 24 * 3600  # 100 days — beyond this it's a broken estimate
+
+
 def _human_eta(seconds: float) -> str:
-    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+    # NaN, inf, negative, or absurdly large (near-zero speed) → unknown
+    if (seconds != seconds or seconds < 0
+            or seconds == float("inf") or seconds > _ETA_MAX):
         return "--:--"
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
@@ -261,12 +266,19 @@ class ProgressMeter:
             return
         cur = self._processed()
         inst = (cur - self._last_sample_bytes) / dt
-        if inst < 0:
-            inst = 0.0
-        self._speed = (
-            inst if self._speed == 0.0
-            else self._SMOOTH * inst + (1 - self._SMOOTH) * self._speed
-        )
+        # Only fold *positive* progress into the EMA. At a file boundary
+        # the .partial/rsync watcher briefly reports 0 for the next file
+        # while committed already includes the finished one, so `cur` can
+        # dip → a clamped-to-0 sample would repeatedly drag the EMA to ~ε,
+        # making _format_line print `0 B/s` and an absurd ETA
+        # (total/ε). Skipping non-positive samples keeps the last real
+        # rate through inter-file gaps. Always advance the sample window
+        # so the next dt stays small.
+        if inst > 0:
+            self._speed = (
+                inst if self._speed == 0.0
+                else self._SMOOTH * inst + (1 - self._SMOOTH) * self._speed
+            )
         self._last_sample_t = now
         self._last_sample_bytes = cur
 
@@ -298,8 +310,15 @@ class ProgressMeter:
 
         parts.append(_human_rate(speed))
 
-        if total_bytes and speed > 0:
-            parts.append(f"ETA {_human_eta((total_bytes - processed) / speed)}")
+        if total_bytes:
+            # Below a small floor the rate is noise → ETA would be a
+            # garbage huge number; show --:-- instead (consistent layout).
+            if speed >= 512 and processed <= total_bytes:
+                parts.append(
+                    f"ETA {_human_eta((total_bytes - processed) / speed)}"
+                )
+            else:
+                parts.append("ETA --:--")
 
         if failures:
             parts.append(f"{failures} failed")
