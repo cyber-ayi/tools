@@ -80,6 +80,37 @@ class _PartialWatch:
                 self._meter.set_inflight(best)
 
 
+def _select_engine(to_copy, job, cfg, use_rsync: bool, v) -> dict:
+    """#236 part 1 — preflight transfer-engine selection.
+
+    A file uses **rsync** (`rsync --append`, resumable across process
+    death) iff: rsync enabled (use_rsync and threshold>0), its size ≥
+    threshold, dst is a local path/mount, and rsync is on PATH. Otherwise
+    **rclone**. Returns {relpath: "rclone"|"rsync"} and logs one line."""
+    thr = job.resolved_resumable_min_size(cfg.defaults) if use_rsync else 0
+    dst_local = rclone.is_local(job.dst)
+    rsync_ok = rclone.have_rsync()
+    eng = {}
+    for e in to_copy:
+        if (thr and dst_local and rsync_ok and max(e.size, 0) >= thr):
+            eng[e.path] = "rsync"
+        else:
+            eng[e.path] = "rclone"
+    n_rs = sum(1 for x in eng.values() if x == "rsync")
+    n_rc = len(eng) - n_rs
+    if v is not None:
+        v.info(
+            f"[copy] engine: rclone×{n_rc}, rsync×{n_rs}"
+            + (f" (≥{progress_mod._human_bytes(thr)} → local dst, resumable)"
+               if thr else " (rsync disabled)")
+        )
+        if (thr and dst_local and not rsync_ok
+                and any(max(e.size, 0) >= thr for e in to_copy)):
+            v.warn("[copy] rsync not found on PATH — large files go via "
+                   "rclone (no process-death resume). Install rsync.")
+    return eng
+
+
 def _clean_stale_partials(job: Job, to_copy, v) -> int:
     """Stage G: remove `.partial` temp files left by a previously
     interrupted run for the files we're about to (re)copy.
@@ -306,6 +337,7 @@ def do_copy(
     full: bool = False,
     dry_run: bool = False,
     clean_partial: bool = True,
+    use_rsync: bool = True,
     progress: bool = True,
     v: Optional[verbose_mod.Verbose] = None,
 ) -> int:
@@ -336,9 +368,19 @@ def do_copy(
             conn.close()
             return 0
 
-        # Stage G: under the job lock, clear partials orphaned by a prior
-        # interrupted run so they can't wedge this one (#157/#212). Skip
-        # for dry-run and when explicitly opted out.
+        # #236 preflight: choose engine per file (rclone vs rsync).
+        engine = _select_engine(
+            plan.to_copy, job, cfg, use_rsync, v if progress else None
+        )
+
+        # Stage G: under the job lock, clear `.partial` orphaned by a
+        # prior interrupted run so they can't wedge this one (#157/#212).
+        # ALL to-copy files, regardless of engine: `.partial` is rclone's
+        # temp suffix only — an rsync-engine file's resume base is the
+        # *final* name (never matched by `*.partial`), so cleaning is
+        # inherently safe for it. (Filtering to rclone-engine here was an
+        # over-correction that orphaned the rclone `.partial` of files
+        # since reassigned to the rsync engine — they were never cleaned.)
         if clean_partial and not dry_run:
             _clean_stale_partials(job, plan.to_copy, v)
 
@@ -373,17 +415,21 @@ def do_copy(
                 if dry_run:
                     v.info(f"  DRY [{i}/{len(plan.to_copy)}] {ent.path}  ({ent.hash})")
                     continue
+                eng = engine[ent.path]
                 if progress:
-                    v.info(f"  [{i}/{len(plan.to_copy)}] {ent.path}")
+                    v.info(f"  [{i}/{len(plan.to_copy)}] {ent.path}  ({eng})")
                     meter.set_current(ent.path)
-                v.detail(f"    rclone copyto {src_full} {dst_full}")
+                v.detail(f"    {eng} {src_full} {dst_full}")
                 try:
                     with (_PartialWatch(dst_full, meter)
                           if live_copy else contextlib.nullcontext()):
-                        rclone.copyto(
-                            src_full, dst_full, algo, transfers=transfers,
-                            extra=extra,
-                        )
+                        if eng == "rsync":
+                            rclone.rsync_copyto(src_full, dst_full)
+                        else:
+                            rclone.copyto(
+                                src_full, dst_full, algo,
+                                transfers=transfers, extra=extra,
+                            )
                     copied_dst_paths.append(ent.path)
                     meter.file_done(committed_size=max(ent.size, 0))
                     ev.record_file("dst", ent.path, outcome="copied", hash=ent.hash)

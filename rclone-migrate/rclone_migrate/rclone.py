@@ -274,10 +274,59 @@ def copyto(src: str, dst: str, algo: str, transfers: int = 8,
     wall-clock model that credits each file's size on completion: always
     correct, no rclone cooperation required.
     """
-    args = ["copyto", "--checksum", "--transfers", str(transfers)]
+    # Hardening (#236 part 2): retry transient SMB/network errors in place
+    # instead of failing the file → full re-copy. NOT --inplace (collides
+    # with Stage C/G .partial machinery; rsync engine is the resumable
+    # -huge-file answer).
+    args = [
+        "copyto", "--checksum", "--transfers", str(transfers),
+        "--retries", "3", "--low-level-retries", "10",
+    ]
     if extra:
         args.extend(extra)
     _run(args + [src, dst], capture=False)
+
+
+def have_rsync() -> bool:
+    return shutil.which("rsync") is not None
+
+
+def rsync_copyto(src: str, dst: str) -> None:
+    """Resumable single-file copy (#236 part 1).
+
+    `rsync --partial --inplace --append`:
+      * `--partial` is REQUIRED. macOS ships **openrsync**, which removes
+        a partially-transferred file on interruption *unless* --partial
+        (`man rsync`: "--partial: Do not remove partially transferred
+        files if openrsync is interrupted"). Without it every killed run
+        discards its progress and only a fluke-surviving partial sticks
+        — the "resumes only from the first break" bug (RCA).
+      * `--append` extends a shorter dst by the missing tail; it implies
+        --inplace (we also pass it explicitly for non-openrsync rsync).
+        Together: a kill leaves the grown dst; the next run continues
+        from the new length → true progressive resume across repeated
+        interruptions.
+
+    `--append` not `--append-verify`: rmig's post-copy xxh3 dst re-hash
+    + MHL is the single integrity gate for both engines; openrsync's
+    --append already whole-file-checksums and delta-heals a bad prefix
+    at the end, so a corrupt tail can't silently pass — and rmig's xxh3
+    is the authoritative DIT check regardless. Caller guarantees dst
+    is local.
+    """
+    rb = shutil.which("rsync")
+    if not rb:
+        raise RcloneError("rsync not found in PATH")
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    full = [rb, "--partial", "--inplace", "--append", "--times", src, dst]
+    if _VERBOSE_HOOK is not None and _VERBOSE_HOOK.is_detail():
+        import shlex
+        _VERBOSE_HOOK.detail("    $ " + " ".join(shlex.quote(a) for a in full))
+    cp = subprocess.run(full, capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise RcloneError(
+            f"rsync --append failed (exit {cp.returncode}):\n{cp.stderr}"
+        )
 
 
 def deletefile(path: str) -> None:

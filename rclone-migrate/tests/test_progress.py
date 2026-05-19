@@ -244,14 +244,52 @@ def test_windowed_copy_speed_from_inflight():
     .partial watcher) yields a real speed + ETA mid-file, not '--'."""
     v = _v()
     m = progress.ProgressMeter(v, "[copy]", total_files=2,
-                               total_bytes=1000)  # default = windowed
+                               total_bytes=10_000_000)  # windowed
     m._last_sample_t = time.time() - 1.0
-    m.set_inflight(200)                   # 200 B into the first file
+    m.set_inflight(4_000_000)             # 4 MB in ~1s → ~4 MB/s (≥ floor)
     m._refresh_speed()
-    assert m._speed > 0                   # inflight drives speed (windowed)
+    assert m._speed > 512
     line = m._format_line()
-    assert "--" not in line.split("cur:")[0]   # a real rate is shown
-    assert "ETA" in line
+    assert "MiB/s" in line and "ETA" in line
+    assert "ETA --:--" not in line       # real ETA at a real rate
+
+
+def test_eta_unknown_below_speed_floor():
+    """Sub-floor / zero speed → 'ETA --:--', never a garbage huge number
+    (the field bug: ETA 4096365853117046538234757:07:12)."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=2,
+                               total_bytes=10**9)
+    m._last_sample_t = time.time() - 1.0
+    m.set_inflight(50)                    # ~50 B/s, below 512 floor
+    m._refresh_speed()
+    assert "ETA --:--" in m._format_line()
+
+
+def test_human_eta_caps_absurd():
+    assert progress._human_eta(30 * 3600) == "30:00:00"     # real long ETA ok
+    assert progress._human_eta(1e18) == "--:--"             # absurd → unknown
+    assert progress._human_eta(float("inf")) == "--:--"
+
+
+def test_speed_ema_not_dragged_by_interfile_dip():
+    """A file-boundary dip (processed momentarily lower) must NOT collapse
+    the EMA to ~0 — only positive samples update it."""
+    v = _v()
+    m = progress.ProgressMeter(v, "[copy]", total_files=3,
+                               total_bytes=10**9)
+    # establish a real rate
+    m._last_sample_t = time.time() - 1.0
+    m.set_inflight(5_000_000)
+    m._refresh_speed()
+    fast = m._speed
+    assert fast > 1_000_000
+    # simulate inter-file dip: processed drops (inflight reset, next file
+    # not yet watched) — speed must hold, not crater toward 0
+    m._inflight = 0
+    m._last_sample_t = time.time() - 1.0
+    m._refresh_speed()
+    assert m._speed == fast              # unchanged (non-positive skipped)
 
 
 def test_quiet_level_is_silent():

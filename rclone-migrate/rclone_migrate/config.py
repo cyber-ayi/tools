@@ -30,6 +30,32 @@ def _parse_duration(s: str) -> float:
     return float(s)
 
 
+_SIZE_UNITS = {
+    "b": 1,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
+    "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
+    "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4,
+}
+
+
+def _parse_size(s) -> int:
+    """Parse '10GiB', '500MiB', '10G', '0', 1234 → bytes. '0'/'' → 0
+    (disabled). Binary units (KiB/GiB) and bare K/M/G are 1024-based;
+    KB/MB/GB are 1000-based."""
+    if s is None:
+        return 0
+    if isinstance(s, (int, float)):
+        return int(s)
+    s = str(s).strip().lower()
+    if not s or s in ("0", "off", "none"):
+        return 0
+    for u in ("tib", "gib", "mib", "kib", "tb", "gb", "mb", "kb",
+              "t", "g", "m", "k", "b"):
+        if s.endswith(u):
+            return int(float(s[: -len(u)]) * _SIZE_UNITS[u])
+    return int(float(s))
+
+
 def _as_str_list(value, key: str, ctx: str) -> Optional[List[str]]:
     if value is None:
         return None
@@ -48,6 +74,11 @@ class Defaults:
     checkers: int = 16
     download: bool = False
     local_cache_in_root: bool = True
+    # Files at least this large, when dst is a local path/mount and rsync
+    # is available, are transferred via `rsync --append` (resumable across
+    # process death — rclone cannot resume a single file). Smaller files /
+    # remote dst / no rsync → rclone. "0"/"off" disables (all rclone).
+    resumable_min_size: str = "10GiB"
     # ASC MHL v2.0 emit: opt-in. When true, copy/check/hash ops write a
     # generation file under <root>/ascmhl/ for the relevant side(s).
     emit_mhl: bool = False
@@ -83,6 +114,7 @@ class Job:
     checkers: Optional[int] = None
     download: Optional[bool] = None
     local_cache_in_root: Optional[bool] = None
+    resumable_min_size: Optional[str] = None
     emit_mhl: Optional[bool] = None
     mhl_author: Optional[str] = None
     mhl_author_phone: Optional[str] = None
@@ -115,6 +147,12 @@ class Job:
             if self.local_cache_in_root is not None
             else defaults.local_cache_in_root
         )
+
+    def resolved_resumable_min_size(self, defaults: Defaults) -> int:
+        """Threshold in bytes; 0 = rsync engine disabled (all rclone)."""
+        raw = (self.resumable_min_size if self.resumable_min_size is not None
+               else defaults.resumable_min_size)
+        return _parse_size(raw)
 
     def resolved_emit_mhl(self, defaults: Defaults) -> bool:
         return self.emit_mhl if self.emit_mhl is not None else defaults.emit_mhl
@@ -235,6 +273,7 @@ def load(path: str | Path) -> Config:
         local_cache_in_root=d.get(
             "local_cache_in_root", Defaults.local_cache_in_root,
         ),
+        resumable_min_size=str(d.get("resumable_min_size", Defaults.resumable_min_size)),
         emit_mhl=bool(d.get("emit_mhl", Defaults.emit_mhl)),
         mhl_author=d.get("mhl_author"),
         mhl_author_phone=d.get("mhl_author_phone"),
@@ -275,6 +314,7 @@ def load(path: str | Path) -> Config:
                 checkers=jr.get("checkers"),
                 download=jr.get("download"),
                 local_cache_in_root=jr.get("local_cache_in_root"),
+                resumable_min_size=jr.get("resumable_min_size"),
                 emit_mhl=jr.get("emit_mhl"),
                 mhl_author=jr.get("mhl_author"),
                 mhl_author_phone=jr.get("mhl_author_phone"),
