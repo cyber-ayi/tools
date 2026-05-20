@@ -5,7 +5,7 @@ data plane). For the all-on-macOS deployment, the trust boundary is
 just "user owns the laptop" and this doc is mostly N/A.
 
 A sibling threat-model lives at
-[`agent-manifest/docs/threat-model.md`](https://github.com/Jarvie8176/agent-manifest)
+[`agent-manifest/docs/threat-model.md`](https://github.com/homelab-s5oyt03iv9/agent-manifest)
 covering the agent stack (memory poisoning, LLM router, etc.). That
 doc cross-references this one; this one focuses on cc-session's
 specific surface.
@@ -57,7 +57,7 @@ documented response times. Tracker: [Jarvie8176/tools#24](https://github.com/Jar
 
 LiteLLM container has the API key in env. Container compromise extracts it.
 
-**Mitigation**: API key is rotatable in Anthropic console. Detection via usage anomaly. The cc-session bastion itself doesn't expose the API key — that's a LiteLLM stack concern; cross-reference [`agent-manifest/docs/threat-model.md`](https://github.com/Jarvie8176/agent-manifest).
+**Mitigation**: API key is rotatable in Anthropic console. Detection via usage anomaly. The cc-session bastion itself doesn't expose the API key — that's a LiteLLM stack concern; cross-reference [`agent-manifest/docs/threat-model.md`](https://github.com/homelab-s5oyt03iv9/agent-manifest).
 
 ### R2: VPS subscription OAuth token leakage
 

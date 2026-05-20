@@ -226,7 +226,7 @@ Both register a fresh RC URL. Update the phone bookmark.
 
 ## What's NOT covered here
 
-- **LiteLLM model router**: lives in [`agent-manifest`](https://github.com/Jarvie8176/agent-manifest)`/infra/litellm/`. Deploy via Portainer stack on the VPS.
+- **LiteLLM model router**: lives in [`agent-manifest`](https://github.com/homelab-s5oyt03iv9/agent-manifest)`/infra/litellm/`. Deploy via Portainer stack on the VPS.
 - **Multi-agent coordination**: see `agent-manifest`'s `inventory.yaml` for agent registry + memory namespacing.
 - **Memory git workflow**: see `agent-manifest`'s `docs/conventions.md`.
 
